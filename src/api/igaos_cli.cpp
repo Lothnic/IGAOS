@@ -29,11 +29,12 @@ void usage() {
         "  --presolve on|off       presolve pass toggle (default on)\n"
         "  --seed <int>            perturbation seed (default 0)\n"
         "  --out <file.json>       write solution JSON here (else stdout)\n"
+        "  --engine <name>         auto|simplex|pdhg|milp|qp (default auto)\n"
         "  --verbose               engine chatter to stderr\n");
 }
 
 struct Args {
-    std::string cmd, model_path, out_path;
+    std::string cmd, model_path, out_path, engine = "auto";
     igaos::Options opts;
     bool ok = true;
 };
@@ -71,7 +72,12 @@ Args parse_args(int argc, char** argv) {
             a.opts.presolve = (std::string(argv[++i]) == "on");
         else if (f == "--verbose") a.opts.verbosity = 1;
         else if (f == "--out" && i + 1 < argc) a.out_path = argv[++i];
-        else a.ok = false;
+        else if (f == "--engine" && i + 1 < argc) {
+            a.engine = argv[++i];
+            if (a.engine != "auto" && a.engine != "simplex" &&
+                a.engine != "pdhg" && a.engine != "milp" && a.engine != "qp")
+                a.ok = false;
+        } else a.ok = false;
     }
     return a;
 }
@@ -86,7 +92,8 @@ std::string json_escape(const std::string& s) {
 }
 
 void emit_json(const Model& mdl, const igaos::Solution& sol,
-               const std::string& instance, const std::string& out_path) {
+               const std::string& instance, const std::string& engine,
+               const std::string& out_path) {
     char buf[512];
     std::snprintf(buf, sizeof(buf),
                   "{\n  \"instance\": \"%s\",\n  \"m\": %d,\n  \"n\": %d,\n"
@@ -94,10 +101,11 @@ void emit_json(const Model& mdl, const igaos::Solution& sol,
                   "  \"objective\": %.10g,\n  \"pinf\": %.3e,\n"
                   "  \"dinf\": %.3e,\n  \"rel_gap\": %.3e,\n"
                   "  \"iterations\": %ld,\n  \"solve_time_ms\": %.1f,\n"
-                  "  \"message\": \"%s\"\n}\n",
+                  "  \"engine\": \"%s\",\n  \"message\": \"%s\"\n}\n",
                   json_escape(instance).c_str(), mdl.m, mdl.n, mdl.nnz(),
                   igaos::status_name(sol.status), sol.objective, sol.pinf,
                   sol.dinf, sol.rel_gap, sol.iterations, sol.solve_time_ms,
+                  json_escape(engine).c_str(),
                   json_escape(sol.message).c_str());
     if (out_path.empty()) {
         std::fputs(buf, stdout);
@@ -169,6 +177,6 @@ int main(int argc, char** argv) {
     igaos::Solution sol;
     sol.status = igaos::Status::Error;
     sol.message = "interface prototype: no engine linked in this build";
-    emit_json(mdl, sol, a.model_path, a.out_path);
+    emit_json(mdl, sol, a.model_path, a.engine, a.out_path);
     return 0;
 }
