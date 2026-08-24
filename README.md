@@ -36,4 +36,21 @@ cmake -S . -B build
 cmake --build build
 ```
 
-Builds CPU-only automatically when no CUDA toolchain is present.
+Builds CPU-only automatically when no CUDA toolchain is present (the PDHG
+engine requires CUDA).
+
+## Solve
+
+```sh
+$ ./build/src/api/igaos solve model.mps --time-limit 60
+{
+  "instance": "model.mps",
+  "status": "near-optimal",
+  "objective": -464.772,
+  "pinf": 1.76e-05,
+  ...
+}
+```
+
+First wired engine: PDHG (first-order GPU LP). Simplex, MILP and QP follow
+their locked specs (#5/#19/#20 resolutions).
