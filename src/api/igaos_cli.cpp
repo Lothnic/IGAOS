@@ -10,6 +10,9 @@
 #include "igaos/solution.h"
 #include "igaos/status.h"
 #include "model.hpp"
+#ifdef IGAOS_HAS_PDHG
+#include "pdhg.hpp"
+#endif
 
 using igaos::io::Model;
 
@@ -82,6 +85,20 @@ Args parse_args(int argc, char** argv) {
     return a;
 }
 
+std::string fmt_e(double v) {
+    if (!std::isfinite(v)) return "null";
+    char b[64];
+    std::snprintf(b, sizeof(b), "%.3e", v);
+    return b;
+}
+
+std::string fmt_g(double v) {
+    if (!std::isfinite(v)) return "null";
+    char b[64];
+    std::snprintf(b, sizeof(b), "%.10g", v);
+    return b;
+}
+
 std::string json_escape(const std::string& s) {
     std::string r;
     for (char ch : s) {
@@ -94,24 +111,29 @@ std::string json_escape(const std::string& s) {
 void emit_json(const Model& mdl, const igaos::Solution& sol,
                const std::string& instance, const std::string& engine,
                const std::string& out_path) {
-    char buf[512];
-    std::snprintf(buf, sizeof(buf),
-                  "{\n  \"instance\": \"%s\",\n  \"m\": %d,\n  \"n\": %d,\n"
-                  "  \"nnz\": %d,\n  \"status\": \"%s\",\n"
-                  "  \"objective\": %.10g,\n  \"pinf\": %.3e,\n"
-                  "  \"dinf\": %.3e,\n  \"rel_gap\": %.3e,\n"
-                  "  \"iterations\": %ld,\n  \"solve_time_ms\": %.1f,\n"
-                  "  \"engine\": \"%s\",\n  \"message\": \"%s\"\n}\n",
-                  json_escape(instance).c_str(), mdl.m, mdl.n, mdl.nnz(),
-                  igaos::status_name(sol.status), sol.objective, sol.pinf,
-                  sol.dinf, sol.rel_gap, sol.iterations, sol.solve_time_ms,
-                  json_escape(engine).c_str(),
-                  json_escape(sol.message).c_str());
+    std::string j = "{\n";
+    j += "  \"instance\": \"" + json_escape(instance) + "\",\n";
+    j += "  \"m\": " + std::to_string(mdl.m) + ",\n";
+    j += "  \"n\": " + std::to_string(mdl.n) + ",\n";
+    j += "  \"nnz\": " + std::to_string(mdl.nnz()) + ",\n";
+    j += std::string("  \"status\": \"") + igaos::status_name(sol.status) +
+         "\",\n";
+    j += "  \"objective\": " + fmt_g(sol.objective) + ",\n";
+    j += "  \"pinf\": " + fmt_e(sol.pinf) + ",\n";
+    j += "  \"dinf\": " + fmt_e(sol.dinf) + ",\n";
+    j += "  \"rel_gap\": " + fmt_e(sol.rel_gap) + ",\n";
+    j += "  \"iterations\": " + std::to_string(sol.iterations) + ",\n";
+    char tb[64];
+    std::snprintf(tb, sizeof(tb), "%.1f", sol.solve_time_ms);
+    j += "  \"solve_time_ms\": " + std::string(tb) + ",\n";
+    j += "  \"engine\": \"" + json_escape(engine) + "\",\n";
+    j += "  \"message\": \"" + json_escape(sol.message) + "\"\n";
+    j += "}\n";
     if (out_path.empty()) {
-        std::fputs(buf, stdout);
+        std::fputs(j.c_str(), stdout);
     } else {
         std::ofstream of(out_path);
-        of << buf;
+        of << j;
     }
 }
 
@@ -175,8 +197,17 @@ int main(int argc, char** argv) {
     if (a.cmd == "info") return cmd_info(mdl);
 
     igaos::Solution sol;
-    sol.status = igaos::Status::Error;
-    sol.message = "interface prototype: no engine linked in this build";
+    if (a.engine == "simplex" || a.engine == "milp" || a.engine == "qp") {
+        sol.status = igaos::Status::Error;
+        sol.message = "engine not yet wired: " + a.engine;
+    } else {
+#ifdef IGAOS_HAS_PDHG
+        sol = igaos::pdhg::solve(mdl, a.opts);
+#else
+        sol.status = igaos::Status::Error;
+        sol.message = "built without CUDA: PDHG engine unavailable";
+#endif
+    }
     emit_json(mdl, sol, a.model_path, a.engine, a.out_path);
     return 0;
 }

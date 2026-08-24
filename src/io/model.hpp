@@ -20,24 +20,39 @@ struct Model {
     std::vector<double> c;
     std::vector<int> ap, ai;
     std::vector<double> ax;
+    std::vector<int> cp, ci;
+    std::vector<double> acx;
 
     int nnz() const { return static_cast<int>(ax.size()); }
 };
 
-inline void counting_sort_csr(const std::vector<std::tuple<int, int, double>>& trips,
-                              int rows, int cols, std::vector<int>& ap,
-                              std::vector<int>& ai, std::vector<double>& ax) {
+inline void counting_sort(const std::vector<std::tuple<int, int, double>>& trips,
+                          int rows, int cols, std::vector<int>& ap,
+                          std::vector<int>& ai, std::vector<double>& ax,
+                          std::vector<int>& cp, std::vector<int>& ci,
+                          std::vector<double>& acx) {
     ap.assign(rows + 1, 0);
-    for (const auto& t : trips) ap[std::get<0>(t) + 1]++;
+    cp.assign(cols + 1, 0);
+    for (const auto& t : trips) {
+        ap[std::get<0>(t) + 1]++;
+        cp[std::get<1>(t) + 1]++;
+    }
     for (int i = 0; i < rows; ++i) ap[i + 1] += ap[i];
-    std::vector<int> next = ap;
+    for (int j = 0; j < cols; ++j) cp[j + 1] += cp[j];
+    std::vector<int> nr = ap, nc = cp;
     ai.resize(trips.size());
     ax.resize(trips.size());
+    ci.resize(trips.size());
+    acx.resize(trips.size());
     for (const auto& t : trips) {
-        int r = std::get<0>(t);
-        ai[next[r]] = std::get<1>(t);
-        ax[next[r]] = std::get<2>(t);
-        next[r]++;
+        int r = std::get<0>(t), c = std::get<1>(t);
+        double v = std::get<2>(t);
+        ai[nr[r]] = c;
+        ax[nr[r]] = v;
+        nr[r]++;
+        ci[nc[c]] = r;
+        acx[nc[c]] = v;
+        nc[c]++;
     }
 }
 
@@ -158,7 +173,8 @@ inline void parse_mps(const std::string& path, Model& model) {
             model.rmax[i] = b;
         }
     }
-    counting_sort_csr(trips, model.m, model.n, model.ap, model.ai, model.ax);
+    counting_sort(trips, model.m, model.n, model.ap, model.ai, model.ax,
+                  model.cp, model.ci, model.acx);
 }
 
 }
