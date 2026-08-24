@@ -1,0 +1,2 @@
+add_library(igaos_api INTERFACE)
+target_link_libraries(igaos_api INTERFACE igaos_simplex igaos_pdhg igaos_io)

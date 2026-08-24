@@ -1,0 +1,2 @@
+add_library(igaos_pdhg INTERFACE)
+target_link_libraries(igaos_pdhg INTERFACE igaos_linalg)

@@ -1,0 +1,22 @@
+cmake_minimum_required(VERSION 3.24)
+project(igaos VERSION 0.1.0 LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+include(CheckLanguage)
+check_language(CUDA)
+if(CMAKE_CUDA_COMPILER)
+  enable_language(CUDA)
+else()
+  message(STATUS "CUDA toolchain not found: building CPU-only")
+endif()
+
+add_subdirectory(src/common)
+add_subdirectory(src/linalg)
+add_subdirectory(src/simplex)
+add_subdirectory(src/pdhg)
+add_subdirectory(src/milp)
+add_subdirectory(src/io)
+add_subdirectory(src/api)

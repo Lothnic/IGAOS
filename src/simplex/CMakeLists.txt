@@ -1,0 +1,2 @@
+add_library(igaos_simplex INTERFACE)
+target_link_libraries(igaos_simplex INTERFACE igaos_linalg)
