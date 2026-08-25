@@ -143,8 +143,12 @@ Solution solve(const io::Model& model, const Options& opt) {
     E.cost.assign((size_t)model.n + model.m, 0.0);
     E.xs_cost.resize(model.n);
     for (int j = 0; j < model.n; ++j) {
-        E.lo[j] = model.cl[j];
-        E.up[j] = model.cu[j];
+        E.lo[j] = std::isfinite(model.cl[j])
+                      ? model.cl[j] / E.sc.col[j]
+                      : -INF;
+        E.up[j] = std::isfinite(model.cu[j])
+                      ? model.cu[j] / E.sc.col[j]
+                      : INF;
         E.xs_cost[j] = model.c[j] * E.sc.col[j];
         E.cmax_x = std::max(E.cmax_x, std::fabs(E.xs_cost[j]));
     }
@@ -715,6 +719,26 @@ Solution solve(const io::Model& model, const Options& opt) {
         for (int p = model.ap[i]; p < model.ap[i + 1]; ++p)
             sol.row_activity[i] += model.ax[p] * sol.x[model.ai[p]];
     }
+    double internal_resid = 0.0;
+    {
+        vector<double> act(E.m, 0.0), col;
+        vector<int> bpos(E.total, -1);
+        for (int i = 0; i < E.m; ++i)
+            if (basis[i] >= 0 && basis[i] < (int)E.total)
+                bpos[basis[i]] = i;
+        for (long j = 0; j < E.total; ++j) {
+            double vj = (st[j] == BASIC) ? zb[bpos[j]] : z[j];
+            if (vj == 0.0) continue;
+            E.col_dense((int)j, col);
+            for (int r = 0; r < E.m; ++r) act[r] += col[r] * vj;
+        }
+        for (int r = 0; r < E.m; ++r)
+            internal_resid = std::max(internal_resid,
+                                      std::fabs(act[r]));
+    }
+    if (opt.verbosity > 0 || internal_resid > 1e-6)
+        std::fprintf(stderr, "[simplex] internal |Mz|inf=%.6g\n",
+                     internal_resid);
     double orig_viol = 0.0;
     for (int j = 0; j < model.n; ++j)
         orig_viol = std::max(orig_viol,
