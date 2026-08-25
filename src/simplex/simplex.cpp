@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <climits>
 #include <limits>
 #include <random>
@@ -155,6 +156,23 @@ Solution solve(const io::Model& model, const Options& opt) {
         E.cost[(size_t)model.n + i] = 0.0;
     }
 
+    if (getenv("IGAOS_DUMP")) {
+        FILE* f = fopen("/tmp/opencode/hav_model.txt", "w");
+        std::fprintf(f, "m=%d n=%d nnz=%d\n", model.m, model.n,
+                     model.nnz());
+        for (int i = 0; i < model.m; ++i)
+            std::fprintf(f, "ROW %d lo=%.17g up=%.17g\n", i, model.rmin[i],
+                         model.rmax[i]);
+        for (int j = 0; j < model.n; ++j)
+            std::fprintf(f, "COL %d lo=%.17g up=%.17g c=%.17g\n", j,
+                         model.cl[j], model.cu[j], model.c[j]);
+        for (int j = 0; j < model.n; ++j)
+            for (int p = model.cp[j]; p < model.cp[j + 1]; ++p)
+                std::fprintf(f, "E %d %d %.17g\n", model.ci[p], j,
+                             model.acx[p]);
+        fclose(f);
+    }
+
     vector<int> basis(model.m, -1);
     vector<unsigned char> st((size_t)model.n + model.m, AT_LOWER);
     vector<double> z((size_t)model.n + model.m, 0.0);
@@ -234,10 +252,18 @@ Solution solve(const io::Model& model, const Options& opt) {
             }
             if (phase1) {
                 double asum = 0.0;
-                for (int i = 0; i < E.m; ++i)
+                double bviol = 0.0;
+                for (int i = 0; i < E.m; ++i) {
                     if (E.kind[basis[i]] == KIND_ART)
                         asum += std::fabs(zb[i]);
-                if (asum <= 1e-8 * (1.0 + E.cmax_x)) return 0;
+                    bviol = std::max(
+                        bviol,
+                        std::max(E.lo[basis[i]] - zb[i],
+                                 zb[i] - E.up[basis[i]]));
+                }
+                if (asum <= 1e-8 * (1.0 + E.cmax_x) &&
+                    bviol <= 1e-7 * (1.0 + E.cmax_x))
+                    return 0;
             }
 
             vector<double> cb(E.m, 0.0);
@@ -284,22 +310,47 @@ Solution solve(const io::Model& model, const Options& opt) {
             int leave_pos = -1;
             double leave_bound = 0.0;
             bool leave_to_upper = false;
-            double athr = 1e-9 * std::max(1.0, amax);
-            if (amax > 1e-9) {
+            const double ALPHA_FLOOR = 1e-10;
+            const double DELTA = 1e-8;
+            if (amax > ALPHA_FLOOR) {
                 for (int i = 0; i < E.m; ++i) {
-                    if (std::fabs(alpha[i]) <= athr) continue;
+                    if (std::fabs(alpha[i]) <= ALPHA_FLOOR) continue;
                     double rate = -alpha[i] * dir0;
-                    double dist = rate > 0 ? (E.up[basis[i]] - zb[i])
+                    bool to_upper = rate > 0;
+                    double dist = to_upper ? (E.up[basis[i]] - zb[i])
                                            : (zb[i] - E.lo[basis[i]]);
                     if (!std::isfinite(dist)) continue;
                     if (dist < 0) dist = 0.0;
-                    double t = std::fabs(dist / rate);
-                    if (!std::isfinite(theta) || t < theta) {
-                        theta = t;
+                    double bmag = std::fabs(to_upper ? E.up[basis[i]]
+                                                     : E.lo[basis[i]]);
+                    double relax = DELTA * (1.0 + bmag);
+                    double t = (dist + relax) /
+                               (std::fabs(rate) * (1.0 + DELTA));
+                    if (!std::isfinite(theta) || t < theta) theta = t;
+                }
+                double best_abs = 0.0;
+                for (int i = 0; i < E.m; ++i) {
+                    if (std::fabs(alpha[i]) <= ALPHA_FLOOR) continue;
+                    double rate = -alpha[i] * dir0;
+                    bool to_upper = rate > 0;
+                    double dist = to_upper ? (E.up[basis[i]] - zb[i])
+                                           : (zb[i] - E.lo[basis[i]]);
+                    if (!std::isfinite(dist)) continue;
+                    if (dist < 0) dist = 0.0;
+                    double t_strict = dist / std::fabs(rate);
+                    double bmag = std::fabs(to_upper ? E.up[basis[i]]
+                                                     : E.lo[basis[i]]);
+                    double relax = DELTA * (1.0 + bmag);
+                    double t_relaxed = (dist + relax) /
+                                       (std::fabs(rate) * (1.0 + DELTA));
+                    if (t_relaxed <= theta &&
+                        std::fabs(alpha[i]) > best_abs) {
+                        best_abs = std::fabs(alpha[i]);
+                        theta = std::max(t_strict, 0.0);
                         leave_pos = i;
-                        leave_to_upper = rate > 0;
-                        leave_bound =
-                            rate > 0 ? E.up[basis[i]] : E.lo[basis[i]];
+                        leave_to_upper = to_upper;
+                        leave_bound = to_upper ? E.up[basis[i]]
+                                               : E.lo[basis[i]];
                     }
                 }
             }
@@ -403,6 +454,21 @@ Solution solve(const io::Model& model, const Options& opt) {
         sol.solve_time_ms = elapsed() * 1000.0;
         return sol;
     }
+    {
+        double bviol = 0.0;
+        for (int i = 0; i < E.m; ++i)
+            bviol = std::max(bviol,
+                             std::max(E.lo[basis[i]] - zb[i],
+                                      zb[i] - E.up[basis[i]]));
+        if (bviol > 1e-6 * (1.0 + E.cmax_x)) {
+            sol.status = Status::Error;
+            sol.message = "phase 1 ended with basic bound violation " +
+                          std::to_string(bviol);
+            sol.iterations = iter;
+            sol.solve_time_ms = elapsed() * 1000.0;
+            return sol;
+        }
+    }
 
     if (opt.verbosity > 0) {
         int nb = 0;
@@ -474,6 +540,22 @@ Solution solve(const io::Model& model, const Options& opt) {
     refresh_values();
     sol.x.resize(model.n);
     for (int j = 0; j < model.n; ++j) sol.x[j] = z[j] * E.sc.col[j];
+    if (getenv("IGAOS_DUMP")) {
+        FILE* f = fopen("/tmp/opencode/simplex_final.txt", "w");
+        std::fprintf(f, "SCALED SOLUTION (zb):\n");
+        for (int i = 0; i < E.m; ++i)
+            std::fprintf(f, "BAS pos=%d var=%ld kind=%d val=%.17g "
+                            "lo=%.17g up=%.17g\n",
+                         i, basis[i], (int)E.kind[basis[i]], zb[i],
+                         E.lo[basis[i]], E.up[basis[i]]);
+        for (long j = 0; j < E.total; ++j)
+            if (st[j] != BASIC)
+                std::fprintf(f, "NB var=%ld kind=%d st=%d val=%.17g "
+                                "lo=%.17g up=%.17g\n",
+                             j, (int)E.kind[j], (int)st[j], z[j], E.lo[j],
+                             E.up[j]);
+        fclose(f);
+    }
     vector<double> cb(E.m, 0.0);
     for (int i = 0; i < E.m; ++i) cb[i] = E.cost[basis[i]];
     vector<double> ysc;
@@ -487,11 +569,27 @@ Solution solve(const io::Model& model, const Options& opt) {
         for (int p = model.ap[i]; p < model.ap[i + 1]; ++p)
             sol.row_activity[i] += model.ax[p] * sol.x[model.ai[p]];
     }
+    double orig_viol = 0.0;
+    for (int j = 0; j < model.n; ++j)
+        orig_viol = std::max(orig_viol,
+                             std::max(model.cl[j] - sol.x[j],
+                                      sol.x[j] - model.cu[j]));
+    for (int i = 0; i < model.m; ++i)
+        orig_viol = std::max(orig_viol,
+                             std::max(model.rmin[i] - sol.row_activity[i],
+                                      sol.row_activity[i] - model.rmax[i]));
+    if (opt.verbosity > 0)
+        std::fprintf(stderr, "[simplex] final orig_viol=%.6g\n", orig_viol);
+    if (orig_viol > 1e-6 * (1.0 + std::fabs(obj))) {
+        sol.status = Status::Error;
+        sol.message = "final solution violates original model by " +
+                      std::to_string(orig_viol);
+    }
     sol.objective = obj;
     sol.pinf = 0.0;
     sol.dinf = 0.0;
     sol.rel_gap = 0.0;
-    sol.status = Status::Optimal;
+    if (sol.status != Status::Error) sol.status = Status::Optimal;
     sol.message = perturbed ? "optimal (cost perturbation applied)"
                             : "optimal";
     sol.iterations = iter;
