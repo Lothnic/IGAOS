@@ -346,6 +346,7 @@ Solution solve(const io::Model& model, const Options& opt) {
 
             double theta = INF;
             double theta_rel = INF;
+            double theta_strict_min = INF;
             int leave_pos = -1;
             double leave_bound = 0.0;
             bool leave_to_upper = false;
@@ -367,6 +368,8 @@ Solution solve(const io::Model& model, const Options& opt) {
                     double t = (dist + relax) /
                                (std::fabs(rate) * (1.0 + DELTA));
                     if (t < theta_rel) theta_rel = t;
+                    double ts = dist / std::fabs(rate);
+                    if (ts < theta_strict_min) theta_strict_min = ts;
                 }
                 double best_abs = STABILITY;
                 for (int i = 0; i < E.m; ++i) {
@@ -424,7 +427,8 @@ Solution solve(const io::Model& model, const Options& opt) {
             }
 
             bool flip = std::isfinite(range) &&
-                        (leave_pos < 0 || theta >= range);
+                        (leave_pos < 0 ||
+                         theta_strict_min >= range);
             if (flip) theta = range;
 
             for (int i = 0; i < E.m; ++i) zb[i] -= alpha[i] * theta * dir0;
@@ -692,7 +696,13 @@ Solution solve(const io::Model& model, const Options& opt) {
     sol.pinf = 0.0;
     sol.dinf = 0.0;
     sol.rel_gap = 0.0;
-    if (sol.status != Status::Error) sol.status = Status::Optimal;
+    if (orig_viol <= 1e-6 * (1.0 + std::fabs(obj))) {
+        sol.status = Status::Optimal;
+    } else {
+        sol.status = Status::Error;
+        sol.message = "final solution violates original model by " +
+                      std::to_string(orig_viol);
+    }
     sol.message = perturbed ? "optimal (cost perturbation applied)"
                             : "optimal";
     sol.iterations = iter;
