@@ -1,6 +1,7 @@
 #include "simplex.hpp"
 
 #include "dense_lu.hpp"
+#include "presolve.hpp"
 #include "scaling.hpp"
 
 #include <algorithm>
@@ -114,76 +115,85 @@ Solution solve(const io::Model& model, const Options& opt) {
             .count();
     };
 
-    Engine E;
-    E.m = model.m;
-    E.nx = model.n;
+    io::Model work = model;
+    PresolveInfo pinfo;
+    {
+        int nch = strengthen_bounds(work, pinfo, 3);
+        if (opt.verbosity > 0)
+            std::fprintf(stderr,
+                         "[simplex] presolve: %d bound tightenings\n", nch);
+    }
 
-    geometric_mean_scaling(model.ap, model.ai, model.ax, model.cp, model.ci,
-                           model.acx, model.m, model.n, 10, E.sc);
+    Engine E;
+    E.m = work.m;
+    E.nx = work.n;
+
+    geometric_mean_scaling(work.ap, work.ai, work.ax, work.cp, work.ci,
+                           work.acx, work.m, work.n, 10, E.sc);
     power_of_two_snap(E.sc.row);
     power_of_two_snap(E.sc.col);
 
-    E.cp = model.cp;
-    E.ci = model.ci;
-    E.cv.resize(model.nnz());
-    for (int j = 0; j < model.n; ++j)
-        for (int p = model.cp[j]; p < model.cp[j + 1]; ++p)
-            E.cv[p] = model.acx[p] * E.sc.row[model.ci[p]] * E.sc.col[j];
-    E.ap = model.ap;
-    E.ai = model.ai;
-    E.av.resize(model.nnz());
-    for (int i = 0; i < model.m; ++i)
-        for (int p = model.ap[i]; p < model.ap[i + 1]; ++p)
-            E.av[p] = model.ax[p] * E.sc.col[model.ai[p]] * E.sc.row[i];
+    E.cp = work.cp;
+    E.ci = work.ci;
+    E.cv.resize(work.nnz());
+    for (int j = 0; j < work.n; ++j)
+        for (int p = work.cp[j]; p < work.cp[j + 1]; ++p)
+            E.cv[p] = work.acx[p] * E.sc.row[work.ci[p]] * E.sc.col[j];
+    E.ap = work.ap;
+    E.ai = work.ai;
+    E.av.resize(work.nnz());
+    for (int i = 0; i < work.m; ++i)
+        for (int p = work.ap[i]; p < work.ap[i + 1]; ++p)
+            E.av[p] = work.ax[p] * E.sc.col[work.ai[p]] * E.sc.row[i];
 
-    E.kind.assign((size_t)model.n + model.m, KIND_SLACK);
-    for (int j = 0; j < model.n; ++j) E.kind[j] = KIND_X;
-    E.lo.resize((size_t)model.n + model.m);
-    E.up.resize((size_t)model.n + model.m);
-    E.cost.assign((size_t)model.n + model.m, 0.0);
-    E.xs_cost.resize(model.n);
-    for (int j = 0; j < model.n; ++j) {
-        E.lo[j] = std::isfinite(model.cl[j])
-                      ? model.cl[j] / E.sc.col[j]
+    E.kind.assign((size_t)work.n + work.m, KIND_SLACK);
+    for (int j = 0; j < work.n; ++j) E.kind[j] = KIND_X;
+    E.lo.resize((size_t)work.n + work.m);
+    E.up.resize((size_t)work.n + work.m);
+    E.cost.assign((size_t)work.n + work.m, 0.0);
+    E.xs_cost.resize(work.n);
+    for (int j = 0; j < work.n; ++j) {
+        E.lo[j] = std::isfinite(work.cl[j])
+                      ? work.cl[j] / E.sc.col[j]
                       : -INF;
-        E.up[j] = std::isfinite(model.cu[j])
-                      ? model.cu[j] / E.sc.col[j]
+        E.up[j] = std::isfinite(work.cu[j])
+                      ? work.cu[j] / E.sc.col[j]
                       : INF;
-        E.xs_cost[j] = model.c[j] * E.sc.col[j];
+        E.xs_cost[j] = work.c[j] * E.sc.col[j];
         E.cmax_x = std::max(E.cmax_x, std::fabs(E.xs_cost[j]));
     }
-    for (int i = 0; i < model.m; ++i) {
-        E.lo[(size_t)model.n + i] =
-            std::isfinite(model.rmin[i]) ? model.rmin[i] * E.sc.row[i] : -INF;
-        E.up[(size_t)model.n + i] =
-            std::isfinite(model.rmax[i]) ? model.rmax[i] * E.sc.row[i] : INF;
-        E.cost[(size_t)model.n + i] = 0.0;
+    for (int i = 0; i < work.m; ++i) {
+        E.lo[(size_t)work.n + i] =
+            std::isfinite(work.rmin[i]) ? work.rmin[i] * E.sc.row[i] : -INF;
+        E.up[(size_t)work.n + i] =
+            std::isfinite(work.rmax[i]) ? work.rmax[i] * E.sc.row[i] : INF;
+        E.cost[(size_t)work.n + i] = 0.0;
     }
 
-    vector<int> basis(model.m, -1);
-    vector<unsigned char> st((size_t)model.n + model.m, AT_LOWER);
-    vector<double> z((size_t)model.n + model.m, 0.0);
+    vector<int> basis(work.m, -1);
+    vector<unsigned char> st((size_t)work.n + work.m, AT_LOWER);
+    vector<double> z((size_t)work.n + work.m, 0.0);
 
-    for (int j = 0; j < model.n; ++j) {
+    for (int j = 0; j < work.n; ++j) {
         if (std::isfinite(E.lo[j])) { st[j] = AT_LOWER; z[j] = E.lo[j]; }
         else if (std::isfinite(E.up[j])) { st[j] = AT_UPPER; z[j] = E.up[j]; }
         else { st[j] = FREE_NB; z[j] = 0.0; }
     }
-    vector<double> ax_val(model.m, 0.0);
-    for (int j = 0; j < model.n; ++j)
+    vector<double> ax_val(work.m, 0.0);
+    for (int j = 0; j < work.n; ++j)
         if (z[j] != 0.0)
             for (int p = E.cp[j]; p < E.cp[j + 1]; ++p)
                 ax_val[E.ci[p]] += E.cv[p] * z[j];
 
-    for (int i = 0; i < model.m; ++i) {
-        int sv = model.n + i;
+    for (int i = 0; i < work.m; ++i) {
+        int sv = work.n + i;
         if (ax_val[i] < E.lo[sv]) { st[sv] = AT_LOWER; z[sv] = E.lo[sv]; }
         else if (ax_val[i] > E.up[sv]) { st[sv] = AT_UPPER; z[sv] = E.up[sv]; }
         else { st[sv] = BASIC; basis[i] = sv; z[sv] = ax_val[i]; }
     }
-    for (int i = 0; i < model.m; ++i) {
+    for (int i = 0; i < work.m; ++i) {
         if (basis[i] >= 0) continue;
-        double rho = ax_val[i] - z[model.n + i];
+        double rho = ax_val[i] - z[work.n + i];
         E.art_row.push_back(i);
         E.art_sigma.push_back(rho > 0 ? -1.0 : 1.0);
         int av_idx = (int)E.kind.size();
@@ -619,10 +629,10 @@ Solution solve(const io::Model& model, const Options& opt) {
         {
             FILE* g = fopen("/tmp/opencode/scaled_final.txt", "w");
             std::fprintf(g, "SCOLS\n");
-            for (int j = 0; j < model.n; ++j)
+            for (int j = 0; j < work.n; ++j)
                 std::fprintf(g, "%d %.17g\n", j, E.sc.col[j]);
             std::fprintf(g, "SROWS\n");
-            for (int i = 0; i < model.m; ++i)
+            for (int i = 0; i < work.m; ++i)
                 std::fprintf(g, "%d %.17g\n", i, E.sc.row[i]);
             std::fprintf(g, "FINAL\n");
             for (long j = 0; j < E.total; ++j)
@@ -632,18 +642,18 @@ Solution solve(const io::Model& model, const Options& opt) {
             fclose(g);
         }
         FILE* f = fopen("/tmp/opencode/hav_model.txt", "w");
-        std::fprintf(f, "m=%d n=%d nnz=%d\n", model.m, model.n,
-                     model.nnz());
-        for (int i = 0; i < model.m; ++i)
-            std::fprintf(f, "ROW %d lo=%.17g up=%.17g\n", i, model.rmin[i],
-                         model.rmax[i]);
-        for (int j = 0; j < model.n; ++j)
+        std::fprintf(f, "m=%d n=%d nnz=%d\n", work.m, work.n,
+                     work.nnz());
+        for (int i = 0; i < work.m; ++i)
+            std::fprintf(f, "ROW %d lo=%.17g up=%.17g\n", i, work.rmin[i],
+                         work.rmax[i]);
+        for (int j = 0; j < work.n; ++j)
             std::fprintf(f, "COL %d lo=%.17g up=%.17g c=%.17g\n", j,
-                         model.cl[j], model.cu[j], model.c[j]);
-        for (int j = 0; j < model.n; ++j)
-            for (int p = model.cp[j]; p < model.cp[j + 1]; ++p)
-                std::fprintf(f, "E %d %d %.17g\n", model.ci[p], j,
-                             model.acx[p]);
+                         work.cl[j], work.cu[j], work.c[j]);
+        for (int j = 0; j < work.n; ++j)
+            for (int p = work.cp[j]; p < work.cp[j + 1]; ++p)
+                std::fprintf(f, "E %d %d %.17g\n", work.ci[p], j,
+                             work.acx[p]);
         fclose(f);
     }
 
@@ -749,13 +759,13 @@ Solution solve(const io::Model& model, const Options& opt) {
         }
     }
 
-    for (long j = (long)model.n + model.m; j < E.total; ++j) {
+    for (long j = (long)work.n + work.m; j < E.total; ++j) {
         E.lo[j] = 0.0;
         E.up[j] = 0.0;
         E.cost[j] = 0.0;
         if (st[j] != BASIC) z[j] = 0.0;
     }
-    for (int j = 0; j < model.n; ++j) E.cost[j] = E.xs_cost[j];
+    for (int j = 0; j < work.n; ++j) E.cost[j] = E.xs_cost[j];
 
     snap_and_resolve();
     bool skip_phase2 = getenv("IGAOS_NO_PHASE2") != nullptr;
@@ -772,11 +782,11 @@ Solution solve(const io::Model& model, const Options& opt) {
     }
 
     snap_and_resolve();
-    sol.x.assign(model.n, 0.0);
+    sol.x.assign(work.n, 0.0);
     for (int i = 0; i < E.m; ++i)
         if (E.kind[basis[i]] == KIND_X)
             sol.x[basis[i]] = zb[i] * E.sc.col[basis[i]];
-    for (long j = 0; j < (long)model.n; ++j)
+    for (long j = 0; j < (long)work.n; ++j)
         if (st[j] != BASIC) sol.x[j] = z[j] * E.sc.col[j];
     if (getenv("IGAOS_DUMP")) {
         FILE* f = fopen("/tmp/opencode/simplex_final.txt", "w");
@@ -798,14 +808,14 @@ Solution solve(const io::Model& model, const Options& opt) {
     for (int i = 0; i < E.m; ++i) cb[i] = E.cost[basis[i]];
     vector<double> ysc;
     lu.solve_transpose(cb, ysc);
-    sol.y.resize(model.m);
-    sol.row_activity.assign(model.m, 0.0);
+    sol.y.resize(work.m);
+    sol.row_activity.assign(work.m, 0.0);
     double obj = 0.0;
-    for (int j = 0; j < model.n; ++j) obj += model.c[j] * sol.x[j];
-    for (int i = 0; i < model.m; ++i) {
+    for (int j = 0; j < work.n; ++j) obj += work.c[j] * sol.x[j];
+    for (int i = 0; i < work.m; ++i) {
         sol.y[i] = E.sc.row[i] * ysc[i];
-        for (int p = model.ap[i]; p < model.ap[i + 1]; ++p)
-            sol.row_activity[i] += model.ax[p] * sol.x[model.ai[p]];
+        for (int p = work.ap[i]; p < work.ap[i + 1]; ++p)
+            sol.row_activity[i] += work.ax[p] * sol.x[work.ai[p]];
     }
     double internal_resid = 0.0;
     {
