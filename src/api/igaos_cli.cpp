@@ -10,6 +10,7 @@
 #include "igaos/solution.h"
 #include "igaos/status.h"
 #include "model.hpp"
+#include "simplex.hpp"
 #ifdef IGAOS_HAS_PDHG
 #include "pdhg.hpp"
 #endif
@@ -73,7 +74,7 @@ Args parse_args(int argc, char** argv) {
         else if (f == "--seed") needl(reinterpret_cast<long&>(a.opts.seed));
         else if (f == "--presolve" && i + 1 < argc)
             a.opts.presolve = (std::string(argv[++i]) == "on");
-        else if (f == "--verbose") a.opts.verbosity = 1;
+        else if (f == "--verbose") ++a.opts.verbosity;
         else if (f == "--out" && i + 1 < argc) a.out_path = argv[++i];
         else if (f == "--engine" && i + 1 < argc) {
             a.engine = argv[++i];
@@ -127,6 +128,14 @@ void emit_json(const Model& mdl, const igaos::Solution& sol,
     std::snprintf(tb, sizeof(tb), "%.1f", sol.solve_time_ms);
     j += "  \"solve_time_ms\": " + std::string(tb) + ",\n";
     j += "  \"engine\": \"" + json_escape(engine) + "\",\n";
+    j += "  \"x\": [";
+    for (size_t idx = 0; idx < sol.x.size(); ++idx) {
+        char xb[64];
+        std::snprintf(xb, sizeof(xb), "%.10g", sol.x[idx]);
+        j += xb;
+        if (idx + 1 < sol.x.size()) j += ",";
+    }
+    j += "],\n";
     j += "  \"message\": \"" + json_escape(sol.message) + "\"\n";
     j += "}\n";
     if (out_path.empty()) {
@@ -197,16 +206,22 @@ int main(int argc, char** argv) {
     if (a.cmd == "info") return cmd_info(mdl);
 
     igaos::Solution sol;
-    if (a.engine == "simplex" || a.engine == "milp" || a.engine == "qp") {
+    if (a.engine == "milp" || a.engine == "qp") {
         sol.status = igaos::Status::Error;
         sol.message = "engine not yet wired: " + a.engine;
-    } else {
+    } else if (a.engine == "simplex") {
+        sol = igaos::simplex::solve(mdl, a.opts);
+    } else if (a.engine == "pdhg") {
 #ifdef IGAOS_HAS_PDHG
         sol = igaos::pdhg::solve(mdl, a.opts);
 #else
         sol.status = igaos::Status::Error;
         sol.message = "built without CUDA: PDHG engine unavailable";
 #endif
+    } else {
+        sol = igaos::simplex::solve(mdl, a.opts);
+        if (sol.status == igaos::Status::Error)
+            sol.message += "; auto fallback failed";
     }
     emit_json(mdl, sol, a.model_path, a.engine, a.out_path);
     return 0;

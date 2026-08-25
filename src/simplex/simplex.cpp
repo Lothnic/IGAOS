@@ -1,0 +1,540 @@
+#include "simplex.hpp"
+
+#include "dense_lu.hpp"
+#include "scaling.hpp"
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <climits>
+#include <limits>
+#include <random>
+#include <vector>
+
+namespace igaos::simplex {
+namespace {
+
+using std::vector;
+
+constexpr double INF = std::numeric_limits<double>::infinity();
+
+enum VarKind : unsigned char { KIND_X = 0, KIND_SLACK = 1, KIND_ART = 2 };
+enum NBStatus : unsigned char { AT_LOWER = 0, AT_UPPER = 1, BASIC = 2,
+                                FREE_NB = 3 };
+
+struct Engine {
+    int m = 0;
+    int nx = 0;
+    long total = 0;
+    vector<double> lo, up, cost;
+    vector<unsigned char> kind;
+    vector<int> art_row;
+    vector<double> art_sigma;
+    vector<int> cp, ci, ap, ai;
+    vector<double> cv, av;
+    Scaling sc;
+    vector<double> xs_cost;
+    double cmax_x = 0.0;
+
+    void col_dense(int j, vector<double>& out) const {
+        out.assign(m, 0.0);
+        switch (kind[j]) {
+            case KIND_X:
+                for (int p = cp[j]; p < cp[j + 1]; ++p) out[ci[p]] = cv[p];
+                break;
+            case KIND_SLACK:
+                out[j - nx] = -1.0;
+                break;
+            case KIND_ART:
+                out[art_row[j - nx - m]] = art_sigma[j - nx - m];
+                break;
+        }
+    }
+
+    double reduced_cost_part(int j, const vector<double>& y) const {
+        switch (kind[j]) {
+            case KIND_X: {
+                double d = cost[j];
+                for (int p = cp[j]; p < cp[j + 1]; ++p)
+                    d -= y[ci[p]] * cv[p];
+                return d;
+            }
+            case KIND_SLACK:
+                return cost[j] + y[j - nx];
+            case KIND_ART:
+                return cost[j] -
+                       y[art_row[j - nx - m]] * art_sigma[j - nx - m];
+        }
+        return 0.0;
+    }
+
+    void accumulate_row_rhs(int j, double vj, vector<double>& rhs) const {
+        if (vj == 0.0) return;
+        switch (kind[j]) {
+            case KIND_X:
+                for (int p = cp[j]; p < cp[j + 1]; ++p)
+                    rhs[ci[p]] -= vj * cv[p];
+                break;
+            case KIND_SLACK:
+                rhs[j - nx] += vj;
+                break;
+            case KIND_ART:
+                rhs[art_row[j - nx - m]] += vj * art_sigma[j - nx - m];
+                break;
+        }
+    }
+
+    void basis_col(int bj, vector<double>& out) const {
+        out.assign(m, 0.0);
+        switch (kind[bj]) {
+            case KIND_X:
+                for (int p = cp[bj]; p < cp[bj + 1]; ++p)
+                    out[ci[p]] = cv[p];
+                break;
+            case KIND_SLACK:
+                out[bj - nx] = -1.0;
+                break;
+            case KIND_ART:
+                out[art_row[bj - nx - m]] = art_sigma[bj - nx - m];
+                break;
+        }
+    }
+};
+
+}  // namespace
+
+Solution solve(const io::Model& model, const Options& opt) {
+    Solution sol;
+    auto t0 = std::chrono::steady_clock::now();
+    auto elapsed = [&]() {
+        return std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                             t0)
+            .count();
+    };
+
+    Engine E;
+    E.m = model.m;
+    E.nx = model.n;
+
+    geometric_mean_scaling(model.ap, model.ai, model.ax, model.cp, model.ci,
+                           model.acx, model.m, model.n, 10, E.sc);
+    power_of_two_snap(E.sc.row);
+    power_of_two_snap(E.sc.col);
+
+    E.cp = model.cp;
+    E.ci = model.ci;
+    E.cv.resize(model.nnz());
+    for (int j = 0; j < model.n; ++j)
+        for (int p = model.cp[j]; p < model.cp[j + 1]; ++p)
+            E.cv[p] = model.acx[p] * E.sc.row[model.ci[p]] * E.sc.col[j];
+    E.ap = model.ap;
+    E.ai = model.ai;
+    E.av.resize(model.nnz());
+    for (int i = 0; i < model.m; ++i)
+        for (int p = model.ap[i]; p < model.ap[i + 1]; ++p)
+            E.av[p] = model.ax[p] * E.sc.col[model.ai[p]] * E.sc.row[i];
+
+    E.kind.assign((size_t)model.n + model.m, KIND_SLACK);
+    for (int j = 0; j < model.n; ++j) E.kind[j] = KIND_X;
+    E.lo.resize((size_t)model.n + model.m);
+    E.up.resize((size_t)model.n + model.m);
+    E.cost.assign((size_t)model.n + model.m, 0.0);
+    E.xs_cost.resize(model.n);
+    for (int j = 0; j < model.n; ++j) {
+        E.lo[j] = model.cl[j];
+        E.up[j] = model.cu[j];
+        E.xs_cost[j] = model.c[j] * E.sc.col[j];
+        E.cmax_x = std::max(E.cmax_x, std::fabs(E.xs_cost[j]));
+    }
+    for (int i = 0; i < model.m; ++i) {
+        E.lo[(size_t)model.n + i] =
+            std::isfinite(model.rmin[i]) ? model.rmin[i] * E.sc.row[i] : -INF;
+        E.up[(size_t)model.n + i] =
+            std::isfinite(model.rmax[i]) ? model.rmax[i] * E.sc.row[i] : INF;
+        E.cost[(size_t)model.n + i] = 0.0;
+    }
+
+    vector<int> basis(model.m, -1);
+    vector<unsigned char> st((size_t)model.n + model.m, AT_LOWER);
+    vector<double> z((size_t)model.n + model.m, 0.0);
+
+    for (int j = 0; j < model.n; ++j) {
+        if (std::isfinite(E.lo[j])) { st[j] = AT_LOWER; z[j] = E.lo[j]; }
+        else if (std::isfinite(E.up[j])) { st[j] = AT_UPPER; z[j] = E.up[j]; }
+        else { st[j] = FREE_NB; z[j] = 0.0; }
+    }
+    vector<double> ax_val(model.m, 0.0);
+    for (int j = 0; j < model.n; ++j)
+        if (z[j] != 0.0)
+            for (int p = E.cp[j]; p < E.cp[j + 1]; ++p)
+                ax_val[E.ci[p]] += E.cv[p] * z[j];
+
+    for (int i = 0; i < model.m; ++i) {
+        int sv = model.n + i;
+        if (ax_val[i] < E.lo[sv]) { st[sv] = AT_LOWER; z[sv] = E.lo[sv]; }
+        else if (ax_val[i] > E.up[sv]) { st[sv] = AT_UPPER; z[sv] = E.up[sv]; }
+        else { st[sv] = BASIC; basis[i] = sv; z[sv] = ax_val[i]; }
+    }
+    for (int i = 0; i < model.m; ++i) {
+        if (basis[i] >= 0) continue;
+        double rho = ax_val[i] - z[model.n + i];
+        E.art_row.push_back(i);
+        E.art_sigma.push_back(rho > 0 ? -1.0 : 1.0);
+        int av_idx = (int)E.kind.size();
+        E.kind.push_back(KIND_ART);
+        E.lo.push_back(0.0);
+        E.up.push_back(INF);
+        E.cost.push_back(1.0);
+        st.push_back(BASIC);
+        z.push_back(std::fabs(rho));
+        basis[i] = av_idx;
+    }
+    E.total = (long)E.kind.size();
+
+    DenseLU lu;
+    vector<double> zb(E.m, 0.0);
+    auto build_and_factor = [&]() {
+        vector<double> Bm((size_t)E.m * E.m, 0.0), col;
+        for (int c = 0; c < E.m; ++c) {
+            E.basis_col(basis[c], col);
+            for (int r = 0; r < E.m; ++r)
+                if (col[r] != 0.0) Bm[(size_t)r * E.m + c] = col[r];
+        }
+        lu.factor(std::move(Bm));
+        return lu.ok;
+    };
+    auto refresh_values = [&]() {
+        vector<double> rhs(E.m, 0.0);
+        for (long j = 0; j < E.total; ++j) {
+            if (st[j] == BASIC || z[j] == 0.0) continue;
+            E.accumulate_row_rhs((int)j, z[j], rhs);
+        }
+        lu.solve(rhs, zb);
+        for (int i = 0; i < E.m; ++i) z[basis[i]] = zb[i];
+    };
+
+    std::mt19937 rng(opt.seed ? (unsigned)opt.seed : 20260825u);
+    long iter = 0;
+    int degen_streak = 0;
+    bool perturbed = false;
+    const int REFACTOR_EVERY = 64;
+
+    auto run_simplex = [&](bool phase1) -> int {
+        bool retry_done = false;
+        for (; iter <= opt.max_iterations; ++iter) {
+            {
+
+                if (!build_and_factor()) {
+                    sol.status = Status::Error;
+                    sol.message = "basis factorization failed";
+                    return 5;
+                }
+                refresh_values();
+            }
+            if (phase1) {
+                double asum = 0.0;
+                for (int i = 0; i < E.m; ++i)
+                    if (E.kind[basis[i]] == KIND_ART)
+                        asum += std::fabs(zb[i]);
+                if (asum <= 1e-8 * (1.0 + E.cmax_x)) return 0;
+            }
+
+            vector<double> cb(E.m, 0.0);
+            for (int i = 0; i < E.m; ++i) cb[i] = E.cost[basis[i]];
+            vector<double> y;
+            lu.solve_transpose(cb, y);
+
+            int enter0 = -1;
+            double best_score = opt.tolerance * 1e-2;
+            double dir0 = 1.0;
+            for (long j = 0; j < E.total; ++j) {
+                if (st[j] == BASIC) continue;
+                if (std::isfinite(E.lo[j]) && std::isfinite(E.up[j]) &&
+                    E.up[j] - E.lo[j] <= 1e-12)
+                    continue;
+                double dj = E.reduced_cost_part((int)j, y);
+                if (st[j] == FREE_NB) {
+                    double score = std::fabs(dj);
+                    if (score > best_score) {
+                        best_score = score;
+                        enter0 = (int)j;
+                        dir0 = dj > 0 ? -1.0 : 1.0;
+                    }
+                } else if (st[j] == AT_LOWER && dj < -best_score) {
+                    best_score = -dj;
+                    enter0 = (int)j;
+                    dir0 = 1.0;
+                } else if (st[j] == AT_UPPER && dj > best_score) {
+                    best_score = dj;
+                    enter0 = (int)j;
+                    dir0 = -1.0;
+                }
+            }
+            if (enter0 < 0) return 0;
+
+            vector<double> ae;
+            E.col_dense(enter0, ae);
+            vector<double> alpha;
+            lu.solve(ae, alpha);
+            if (opt.verbosity > 1)
+                std::fprintf(stderr,
+                             "[simplex] PRE it=%ld ph1=%d enter=%d dir=%+.0f "
+                             "score=%.3g kind=%d lo=%.4g up=%.4g\n",
+                             iter, (int)phase1, enter0, dir0, best_score,
+                             (int)E.kind[enter0], E.lo[enter0], E.up[enter0]);
+            if (opt.verbosity > 2) {
+                std::fprintf(stderr, "ALPHA:");
+                for (int i = 0; i < E.m; ++i)
+                    std::fprintf(stderr, " %.6g", alpha[i]);
+                std::fprintf(stderr, "\nZB:");
+                for (int i = 0; i < E.m; ++i)
+                    std::fprintf(stderr, " %.6g", zb[i]);
+                std::fprintf(stderr, "\n");
+                if (iter == 0)
+                    for (int i = 0; i < E.m; ++i)
+                        std::fprintf(stderr,
+                                     "  p%02d v%3ld k%d a%+8.4g z%+10.4f "
+                                     "l%.3g u%.3g\n",
+                                     i, basis[i], (int)E.kind[basis[i]],
+                                     alpha[i], zb[i],
+                                     E.lo[basis[i]] == -INF
+                                         ? -1e31
+                                         : E.lo[basis[i]],
+                                     E.up[basis[i]] == INF ? 1e31
+                                                           : E.up[basis[i]]);
+            }
+
+
+            double theta = INF;
+            int leave_pos = -1;
+            double leave_bound = 0.0;
+            bool leave_to_upper = false;
+            double best_pivot = 0.0;
+            for (int pass = 0; pass < 2; ++pass) {
+                if (pass == 1) {
+                    theta = INF;
+                    leave_pos = -1;
+                    best_pivot = 0.0;
+                }
+                double limit =
+                    pass == 0 ? INF : theta * (1.0 + 1e-9) + 1e-9;
+                for (int i = 0; i < E.m; ++i) {
+                    if (std::fabs(alpha[i]) <= 1e-11) continue;
+                    double rate = -alpha[i] * dir0;
+                    double dist = rate > 0 ? (E.up[basis[i]] - zb[i])
+                                           : (zb[i] - E.lo[basis[i]]);
+                    if (!std::isfinite(dist)) continue;
+                    if (dist < 0) dist = 0.0;
+                    double t = dist / std::fabs(rate);
+                    if (pass == 0) {
+                        if (t < theta) theta = t;
+                    } else if (t <= limit &&
+                               std::fabs(alpha[i]) > best_pivot) {
+                        best_pivot = std::fabs(alpha[i]);
+                        theta = t;
+                        leave_pos = i;
+                        leave_to_upper = rate > 0;
+                        leave_bound = rate > 0 ? E.up[basis[i]]
+                                               : E.lo[basis[i]];
+                    }
+                }
+                if (pass == 0 && !std::isfinite(theta)) break;
+            }
+
+            double range = (st[enter0] == FREE_NB)
+                               ? INF
+                               : (E.up[enter0] - E.lo[enter0]);
+
+            if ((leave_pos < 0 || theta > range) && !std::isfinite(range)) {
+                if (!retry_done) {
+                    retry_done = true;
+                    continue;
+                }
+                sol.status = Status::Unbounded;
+                sol.message = phase1 ? "phase 1 unbounded (anomaly)"
+                                     : "unbounded: no blocking variable";
+                return 2;
+            }
+
+            bool flip = std::isfinite(range) &&
+                        (leave_pos < 0 || theta >= range);
+            if (flip) theta = range;
+
+            for (int i = 0; i < E.m; ++i) zb[i] -= alpha[i] * theta * dir0;
+            z[enter0] += theta * dir0;
+
+            if (opt.verbosity > 2) {
+                int bmin = INT_MAX, bmax = INT_MIN;
+                for (int i = 0; i < E.m; ++i) {
+                    bmin = std::min(bmin, basis[i]);
+                    bmax = std::max(bmax, basis[i]);
+                }
+                std::fprintf(stderr,
+                             "[simplex] it=%ld basis range [%d,%d] "
+                             "total=%ld\n",
+                             iter, bmin, bmax, E.total);
+                const vector<double>& chk = zb;
+                double worst_v = 0.0;
+                int worst_i = -1;
+                for (int i = 0; i < E.m; ++i) {
+                    double v =
+                        std::max(E.lo[basis[i]] - chk[i],
+                                 chk[i] - E.up[basis[i]]);
+                    v = std::max(v, 0.0);
+                    if (v > worst_v) { worst_v = v; worst_i = i; }
+                }
+                bool bad_nb = false;
+                int bad_j = -1;
+                for (long j = 0; j < E.total && !bad_nb; ++j) {
+                    if (st[j] == BASIC) continue;
+                    if (st[j] == AT_LOWER &&
+                        std::fabs(z[j] - E.lo[j]) > 1e-6)
+                        bad_nb = true, bad_j = (int)j;
+                    if (st[j] == AT_UPPER &&
+                        std::fabs(z[j] - E.up[j]) > 1e-6)
+                        bad_nb = true, bad_j = (int)j;
+                }
+                if (worst_v > 1e-7 || bad_nb)
+                    std::fprintf(stderr,
+                                 "[simplex] INVARIANT BREAK it=%ld "
+                                 "worst_basic=%.3g@%d badnb=%d\n",
+                                 iter, worst_v, worst_i, bad_j);
+            }
+
+            degen_streak = theta <= 1e-9 ? degen_streak + 1 : 0;
+            if (degen_streak > 30 && !perturbed) {
+                std::uniform_real_distribution<double> ud(-1.0, 1.0);
+                for (int j = 0; j < E.nx; ++j)
+                    E.cost[j] += ud(rng) * 1e-5 * std::max(1.0, E.cmax_x);
+                perturbed = true;
+                degen_streak = 0;
+            }
+
+            if (flip) {
+                st[enter0] = (dir0 > 0) ? AT_UPPER : AT_LOWER;
+                z[enter0] = (dir0 > 0) ? E.up[enter0] : E.lo[enter0];
+                continue;
+            }
+
+            int leaving = basis[leave_pos];
+            z[leaving] = leave_bound;
+            st[leaving] = leave_to_upper ? AT_UPPER : AT_LOWER;
+            basis[leave_pos] = enter0;
+            st[enter0] = BASIC;
+            zb[leave_pos] = leave_bound;
+
+            if (elapsed() > opt.time_limit_s) {
+                sol.status = Status::TimeLimit;
+                sol.message = "wall-clock budget exhausted";
+                return 3;
+            }
+        }
+        sol.status = Status::IterationLimit;
+        sol.message = "iteration cap reached";
+        return 4;
+    };
+
+    int rc1 = run_simplex(true);
+    if (rc1 != 0) {
+        sol.iterations = iter;
+        sol.solve_time_ms = elapsed() * 1000.0;
+        return sol;
+    }
+
+    if (opt.verbosity > 0) {
+        int nb = 0;
+        for (int i = 0; i < E.m; ++i)
+            if (E.kind[basis[i]] == KIND_ART) ++nb;
+        std::fprintf(stderr, "[simplex] phase1 done iter=%ld arts_basic=%d\n",
+                     iter, nb);
+    }
+
+    for (int i = 0; i < E.m; ++i) {
+        if (E.kind[basis[i]] != KIND_ART) continue;
+        vector<double> unit(E.m, 0.0);
+        unit[i] = 1.0;
+        vector<double> erow;
+        lu.solve_transpose(unit, erow);
+        int pick = -1;
+        double best_abs = 1e-9;
+        for (long j = 0; j < E.total; ++j) {
+            if (st[j] == BASIC || E.kind[j] == KIND_ART) continue;
+            double aij = 0.0;
+            switch (E.kind[j]) {
+                case KIND_X:
+                    for (int p = E.cp[j]; p < E.cp[j + 1]; ++p)
+                        aij += erow[E.ci[p]] * E.cv[p];
+                    break;
+                case KIND_SLACK:
+                    aij = -erow[j - E.nx];
+                    break;
+                default:
+                    break;
+            }
+            if (std::fabs(aij) > best_abs) {
+                best_abs = std::fabs(aij);
+                pick = (int)j;
+            }
+        }
+        if (pick >= 0) {
+            int old_art = basis[i];
+            basis[i] = pick;
+            st[pick] = BASIC;
+            z[old_art] = 0.0;
+            st[old_art] = AT_LOWER;
+            build_and_factor();
+            refresh_values();
+        } else {
+            E.lo[basis[i]] = 0.0;
+            E.up[basis[i]] = 0.0;
+            z[basis[i]] = std::min(std::max(zb[i], E.lo[basis[i]]),
+                                   E.up[basis[i]]);
+        }
+    }
+
+    for (long j = (long)model.n + model.m; j < E.total; ++j) {
+        E.lo[j] = 0.0;
+        E.up[j] = 0.0;
+        E.cost[j] = 0.0;
+        if (st[j] != BASIC) z[j] = 0.0;
+    }
+    for (int j = 0; j < model.n; ++j) E.cost[j] = E.xs_cost[j];
+
+    int rc2 = run_simplex(false);
+    if (rc2 != 0) {
+        sol.iterations = iter;
+        sol.solve_time_ms = elapsed() * 1000.0;
+        return sol;
+    }
+
+    build_and_factor();
+    refresh_values();
+    sol.x.resize(model.n);
+    for (int j = 0; j < model.n; ++j) sol.x[j] = z[j] * E.sc.col[j];
+    vector<double> cb(E.m, 0.0);
+    for (int i = 0; i < E.m; ++i) cb[i] = E.cost[basis[i]];
+    vector<double> ysc;
+    lu.solve_transpose(cb, ysc);
+    sol.y.resize(model.m);
+    sol.row_activity.assign(model.m, 0.0);
+    double obj = 0.0;
+    for (int j = 0; j < model.n; ++j) obj += model.c[j] * sol.x[j];
+    for (int i = 0; i < model.m; ++i) {
+        sol.y[i] = E.sc.row[i] * ysc[i];
+        for (int p = model.ap[i]; p < model.ap[i + 1]; ++p)
+            sol.row_activity[i] += model.ax[p] * sol.x[model.ai[p]];
+    }
+    sol.objective = obj;
+    sol.pinf = 0.0;
+    sol.dinf = 0.0;
+    sol.rel_gap = 0.0;
+    sol.status = Status::Optimal;
+    sol.message = perturbed ? "optimal (cost perturbation applied)"
+                            : "optimal";
+    sol.iterations = iter;
+    sol.solve_time_ms = elapsed() * 1000.0;
+    return sol;
+}
+
+}  // namespace igaos::simplex

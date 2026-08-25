@@ -8,11 +8,13 @@ namespace igaos::simplex {
 struct DenseLU {
     int n = 0;
     std::vector<double> a;
+    std::vector<double> kept;
     std::vector<int> perm;
     bool ok = false;
 
     void factor(std::vector<double> m_in) {
         n = static_cast<int>(std::sqrt((double)m_in.size()));
+        kept = m_in;
         a = std::move(m_in);
         perm.resize(n);
         ok = true;
