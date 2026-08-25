@@ -25,3 +25,6 @@ if(IGAOS_HAVE_PDHG)
   add_subdirectory(src/pdhg)
 endif()
 add_subdirectory(src/api)
+
+enable_testing()
+add_subdirectory(tests)

@@ -1,2 +1,3 @@
 add_library(igaos_simplex INTERFACE)
-target_link_libraries(igaos_simplex INTERFACE igaos_linalg)
+target_include_directories(igaos_simplex INTERFACE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(igaos_simplex INTERFACE igaos_io)
