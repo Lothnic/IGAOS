@@ -434,29 +434,6 @@ Solution solve(const io::Model& model, const Options& opt) {
                     retry_done = true;
                     continue;
                 }
-                if (opt.verbosity > 0) {
-                    std::fprintf(stderr,
-                                 "[simplex] RAY enter=%d kind=%d c=%.4g "
-                                 "amax=%.3g alpha_nnz_gt1e12=",
-                                 enter0, (int)E.kind[enter0],
-                                 E.cost[enter0], amax);
-                    int cnt = 0;
-                    for (int i = 0; i < E.m; ++i)
-                        if (std::fabs(alpha[i]) > 1e-12) ++cnt;
-                    std::fprintf(stderr, "%d\n", cnt);
-                    int shown = 0;
-                    for (int i = 0; i < E.m && shown < 6; ++i)
-                        if (std::fabs(alpha[i]) > 1e-12) {
-                            std::fprintf(stderr,
-                                         "   p%02d v%4ld k%d a%+.4g z%.4g "
-                                         "l%.4g u%.4g\n",
-                                         i, basis[i],
-                                         (int)E.kind[basis[i]], alpha[i],
-                                         zb[i], E.lo[basis[i]],
-                                         E.up[basis[i]]);
-                            ++shown;
-                        }
-                }
                 sol.status = Status::Unbounded;
                 sol.message = phase1 ? "phase 1 unbounded (anomaly)"
                                      : "unbounded: no blocking variable";
@@ -569,14 +546,6 @@ Solution solve(const io::Model& model, const Options& opt) {
         FILE* f = fopen("/tmp/opencode/hav_model.txt", "w");
         std::fprintf(f, "m=%d n=%d nnz=%d\n", model.m, model.n,
                      model.nnz());
-        std::fprintf(f, "RTYPES\n");
-        {
-            int eC = 0, lC = 0, gC = 0;
-            for (int i = 0; i < model.m; ++i)
-                std::fprintf(f, "R %d %.17g %.17g\n", i, model.rmin[i],
-                             model.rmax[i]);
-            (void)eC; (void)lC; (void)gC;
-        }
         for (int i = 0; i < model.m; ++i)
             std::fprintf(f, "ROW %d lo=%.17g up=%.17g\n", i, model.rmin[i],
                          model.rmax[i]);
