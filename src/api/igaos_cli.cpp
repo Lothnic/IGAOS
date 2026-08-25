@@ -10,6 +10,7 @@
 #include "igaos/solution.h"
 #include "igaos/status.h"
 #include "model.hpp"
+#include "milp.hpp"
 #include "simplex.hpp"
 #ifdef IGAOS_HAS_PDHG
 #include "pdhg.hpp"
@@ -206,9 +207,11 @@ int main(int argc, char** argv) {
     if (a.cmd == "info") return cmd_info(mdl);
 
     igaos::Solution sol;
-    if (a.engine == "milp" || a.engine == "qp") {
+    if (a.engine == "qp") {
         sol.status = igaos::Status::Error;
-        sol.message = "engine not yet wired: " + a.engine;
+        sol.message = "engine not yet wired: qp";
+    } else if (a.engine == "milp") {
+        sol = igaos::milp::solve(mdl, a.opts);
     } else if (a.engine == "simplex") {
         sol = igaos::simplex::solve(mdl, a.opts);
     } else if (a.engine == "pdhg") {

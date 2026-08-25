@@ -22,6 +22,7 @@ struct Model {
     std::vector<double> ax;
     std::vector<int> cp, ci;
     std::vector<double> acx;
+    std::vector<unsigned char> integ;
 
     int nnz() const { return static_cast<int>(ax.size()); }
 };
@@ -66,6 +67,7 @@ inline void parse_mps(const std::string& path, Model& model) {
     std::vector<double> rhs;
     std::vector<std::tuple<int, int, double>> trips;
     std::vector<std::pair<int, double>> ranges;
+    bool pending_int = false;
 
     while (std::getline(in, line)) {
         if (line.empty() || line[0] == '*') continue;
@@ -87,7 +89,10 @@ inline void parse_mps(const std::string& path, Model& model) {
                 rhs.push_back(0.0);
             }
         } else if (section == "COLUMNS") {
-            if (line.find("'MARKER'") != std::string::npos) continue;
+            if (line.find("'MARKER'") != std::string::npos) {
+                pending_int = line.find("INTORG") != std::string::npos;
+                continue;
+            }
             auto ci = colidx.find(t[0]);
             int j;
             if (ci == colidx.end()) {
@@ -96,6 +101,8 @@ inline void parse_mps(const std::string& path, Model& model) {
                 model.c.push_back(0.0);
                 model.cl.push_back(0.0);
                 model.cu.push_back(INF);
+                model.integ.push_back(
+                    static_cast<unsigned char>(pending_int ? 1 : 0));
             } else {
                 j = ci->second;
             }
@@ -142,10 +149,13 @@ inline void parse_mps(const std::string& path, Model& model) {
             } else if (type == "BV") {
                 model.cl[j] = 0.0;
                 model.cu[j] = 1.0;
+                model.integ[j] = 1;
             } else if (type == "LI") {
                 model.cl[j] = v;
+                model.integ[j] = 1;
             } else if (type == "UI") {
                 model.cu[j] = v;
+                model.integ[j] = 1;
             }
         }
     }
