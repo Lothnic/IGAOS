@@ -235,6 +235,8 @@ Solution solve(const io::Model& model, const Options& opt) {
         for (int i = 0; i < E.m; ++i) z[basis[i]] = zb[i];
     };
 
+    bool inv_logged = false;
+
     std::mt19937 rng(opt.seed ? (unsigned)opt.seed : 20260825u);
     long iter = 0;
     int degen_streak = 0;
@@ -244,6 +246,64 @@ Solution solve(const io::Model& model, const Options& opt) {
     const int REFACTOR_EVERY = 64;
 
     auto run_simplex = [&](bool phase1) -> int {
+        auto verify_pivot_invariant = [&](const char* tag, int enter,
+                                          int lpos, long lvar, double th,
+                                          double dr) {
+            if (inv_logged) return;
+            vector<int> pos(E.total, -1);
+            bool ghost = false;
+            for (int i = 0; i < E.m; ++i) {
+                if (basis[i] < 0 || basis[i] >= (int)E.total) {
+                    ghost = true;
+                    continue;
+                }
+                if (pos[basis[i]] >= 0) ghost = true;
+                pos[basis[i]] = i;
+            }
+            vector<double> act(E.m, 0.0);
+            double mag = 1.0;
+            for (long j = 0; j < E.total; ++j) {
+                long pj = (st[j] == BASIC) ? pos[j] : -1;
+                double vj = (pj >= 0) ? zb[pj] : z[j];
+                if (st[j] == BASIC && pj < 0) ghost = true;
+                if (vj == 0.0) continue;
+                switch (E.kind[j]) {
+                    case KIND_X:
+                        for (int p = E.cp[j]; p < E.cp[j + 1]; ++p) {
+                            double t = E.cv[p] * vj;
+                            act[E.ci[p]] += t;
+                            mag = std::max(mag, std::fabs(t));
+                        }
+                        break;
+                    case KIND_SLACK: {
+                        double t = -vj;
+                        act[j - E.nx] += t;
+                        mag = std::max(mag, std::fabs(t));
+                        break;
+                    }
+                    case KIND_ART: {
+                        int k = (int)(j - E.nx - E.m);
+                        double t = E.art_sigma[k] * vj;
+                        act[E.art_row[k]] += t;
+                        mag = std::max(mag, std::fabs(t));
+                        break;
+                    }
+                }
+            }
+            double resid = ghost ? INF : 0.0;
+            for (int r = 0; r < E.m; ++r)
+                resid = std::max(resid, std::fabs(act[r]));
+            if (resid <= 1e-6 * mag) return;
+            inv_logged = true;
+            std::fprintf(stderr,
+                         "[simplex] PIVOT INVARIANT BREAK (%s) it=%ld "
+                         "ph1=%d |Mz|=%.6g enter=%ld leave=%ld@%d "
+                         "theta=%.10g dir=%.6g zb[lp]=%.10g "
+                         "z[enter]=%.10g\n",
+                         tag, iter, (int)phase1, resid, (long)enter, lvar,
+                         lpos, th, dr, lpos >= 0 ? zb[lpos] : 0.0,
+                         z[enter]);
+        };
         bool retry_done = false;
         for (; iter <= opt.max_iterations; ++iter) {
             {
@@ -604,6 +664,7 @@ Solution solve(const io::Model& model, const Options& opt) {
             if (flip) {
                 st[enter0] = (dir0 > 0) ? AT_UPPER : AT_LOWER;
                 z[enter0] = (dir0 > 0) ? E.up[enter0] : E.lo[enter0];
+                verify_pivot_invariant("flip", enter0, -1, -1, theta, dir0);
                 continue;
             }
 
@@ -612,7 +673,9 @@ Solution solve(const io::Model& model, const Options& opt) {
             st[leaving] = leave_to_upper ? AT_UPPER : AT_LOWER;
             basis[leave_pos] = enter0;
             st[enter0] = BASIC;
-            zb[leave_pos] = leave_bound;
+            zb[leave_pos] = z[enter0];
+            verify_pivot_invariant("pivot", enter0, leave_pos, leaving,
+                                   theta, dir0);
 
             if (elapsed() > opt.time_limit_s) {
                 sol.status = Status::TimeLimit;
