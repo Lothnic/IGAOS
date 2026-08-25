@@ -228,7 +228,9 @@ Solution solve(const io::Model& model, const Options& opt) {
     std::mt19937 rng(opt.seed ? (unsigned)opt.seed : 20260825u);
     long iter = 0;
     int degen_streak = 0;
+    bool bland = false;
     bool perturbed = false;
+    (void)perturbed;
     const int REFACTOR_EVERY = 64;
 
     auto run_simplex = [&](bool phase1) -> int {
@@ -349,6 +351,30 @@ Solution solve(const io::Model& model, const Options& opt) {
                     dir0 = -1.0;
                 }
             }
+            if (enter0 < 0 && bland) {
+                for (long j = 0; j < E.total; ++j) {
+                    if (st[j] == BASIC) continue;
+                    if (std::isfinite(E.lo[j]) && std::isfinite(E.up[j]) &&
+                        E.up[j] - E.lo[j] <= 1e-12)
+                        continue;
+                    double dj = E.reduced_cost_part((int)j, y);
+                    if (st[j] == FREE_NB && std::fabs(dj) > 1e-9) {
+                        enter0 = (int)j;
+                        dir0 = dj > 0 ? -1.0 : 1.0;
+                        break;
+                    }
+                    if (st[j] == AT_LOWER && dj < -1e-9) {
+                        enter0 = (int)j;
+                        dir0 = 1.0;
+                        break;
+                    }
+                    if (st[j] == AT_UPPER && dj > 1e-9) {
+                        enter0 = (int)j;
+                        dir0 = -1.0;
+                        break;
+                    }
+                }
+            }
             if (enter0 < 0) return 0;
 
             vector<double> ae;
@@ -410,6 +436,50 @@ Solution solve(const io::Model& model, const Options& opt) {
                                                : E.lo[basis[i]];
                     }
                 }
+                if (bland) {
+                    double tmin = INF;
+                    for (int i = 0; i < E.m; ++i) {
+                        if (std::fabs(alpha[i]) <= ALPHA_FLOOR) continue;
+                        double rate2 = -alpha[i] * dir0;
+                        double dist2 =
+                            rate2 > 0 ? (E.up[basis[i]] - zb[i])
+                                      : (zb[i] - E.lo[basis[i]]);
+                        if (!std::isfinite(dist2)) continue;
+                        if (dist2 < 0) dist2 = 0.0;
+                        double ts = dist2 / std::fabs(rate2);
+                        if (ts < tmin) tmin = ts;
+                    }
+                    if (std::isfinite(tmin)) {
+                        double lim = tmin * (1.0 + 1e-12) + 1e-12;
+                        long bestvar = std::numeric_limits<long>::max();
+                        int bpos = -1;
+                        bool bu = false;
+                        double bb = 0.0;
+                        for (int i = 0; i < E.m; ++i) {
+                            if (std::fabs(alpha[i]) <= ALPHA_FLOOR)
+                                continue;
+                            double rate2 = -alpha[i] * dir0;
+                            double dist2 =
+                                rate2 > 0 ? (E.up[basis[i]] - zb[i])
+                                          : (zb[i] - E.lo[basis[i]]);
+                            if (!std::isfinite(dist2)) continue;
+                            if (dist2 < 0) dist2 = 0.0;
+                            double ts = dist2 / std::fabs(rate2);
+                            if (ts <= lim && basis[i] < bestvar) {
+                                bestvar = basis[i];
+                                bpos = i;
+                                bu = rate2 > 0;
+                                bb = bu ? E.up[basis[i]] : E.lo[basis[i]];
+                            }
+                        }
+                        if (bpos >= 0) {
+                            theta = tmin;
+                            leave_pos = bpos;
+                            leave_to_upper = bu;
+                            leave_bound = bb;
+                        }
+                    }
+                }
                 if (leave_pos >= 0) {
                     double rate =
                         -alpha[leave_pos] * dir0;
@@ -433,6 +503,22 @@ Solution solve(const io::Model& model, const Options& opt) {
                 if (!retry_done) {
                     retry_done = true;
                     continue;
+                }
+                if (opt.verbosity > 0) {
+                    std::fprintf(stderr,
+                                 "[RAY] enter=%d kind=%d lo=%.4g up=%.4g "
+                                 "amax=%.3g\n",
+                                 enter0, (int)E.kind[enter0], E.lo[enter0],
+                                 E.up[enter0], amax);
+                    for (int i = 0; i < E.m; ++i)
+                        if (std::fabs(alpha[i]) > 1e-12)
+                            std::fprintf(stderr,
+                                         " p%d v%ld k%d a%.4g z%.4g "
+                                         "l%.3g u%.3g\n",
+                                         i, basis[i],
+                                         (int)E.kind[basis[i]], alpha[i],
+                                         zb[i], E.lo[basis[i]],
+                                         E.up[basis[i]]);
                 }
                 sol.status = Status::Unbounded;
                 sol.message = phase1 ? "phase 1 unbounded (anomaly)"
@@ -494,13 +580,15 @@ Solution solve(const io::Model& model, const Options& opt) {
                 }
             }
 
-            degen_streak = theta <= 1e-9 ? degen_streak + 1 : 0;
-            if (degen_streak > 30 && !perturbed) {
-                std::uniform_real_distribution<double> ud(-1.0, 1.0);
-                for (int j = 0; j < E.nx; ++j)
-                    E.cost[j] += ud(rng) * 1e-5 * std::max(1.0, E.cmax_x);
-                perturbed = true;
+            if (theta > 1e-9) {
                 degen_streak = 0;
+                bland = false;
+            } else {
+                ++degen_streak;
+                if (degen_streak >= 20 && !bland) {
+                    bland = true;
+                    degen_streak = 0;
+                }
             }
 
             if (flip) {
