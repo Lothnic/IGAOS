@@ -231,6 +231,16 @@ Solution solve(const io::Model& model, const Options& opt) {
         bool retry_done = false;
         for (; iter <= opt.max_iterations; ++iter) {
             {
+                for (long j = 0; j < E.total; ++j) {
+                    if (st[j] == BASIC) continue;
+                    if (st[j] == AT_LOWER && std::isfinite(E.lo[j]))
+                        z[j] = E.lo[j];
+                    else if (st[j] == AT_UPPER && std::isfinite(E.up[j]))
+                        z[j] = E.up[j];
+                    else if (std::isfinite(E.lo[j])) { st[j] = AT_LOWER; z[j] = E.lo[j]; }
+                    else if (std::isfinite(E.up[j])) { st[j] = AT_UPPER; z[j] = E.up[j]; }
+                    else st[j] = FREE_NB;
+                }
 
                 if (!build_and_factor()) {
                     sol.status = Status::Error;
@@ -465,11 +475,19 @@ Solution solve(const io::Model& model, const Options& opt) {
                         std::fabs(z[j] - E.up[j]) > 1e-6)
                         bad_nb = true, bad_j = (int)j;
                 }
-                if (worst_v > 1e-7 || bad_nb)
+                if ((worst_v > 1e-7 || bad_nb) && opt.verbosity > 2) {
                     std::fprintf(stderr,
                                  "[simplex] INVARIANT BREAK it=%ld "
                                  "worst_basic=%.3g@%d badnb=%d\n",
                                  iter, worst_v, worst_i, bad_j);
+                    if (bad_j >= 0)
+                        std::fprintf(stderr,
+                                     "   var=%d kind=%d st=%u z=%.6g "
+                                     "lo=%.6g up=%.6g\n",
+                                     bad_j, (int)E.kind[bad_j],
+                                     (unsigned)st[bad_j], z[bad_j],
+                                     E.lo[bad_j], E.up[bad_j]);
+                }
             }
 
             degen_streak = theta <= 1e-9 ? degen_streak + 1 : 0;
@@ -538,12 +556,25 @@ Solution solve(const io::Model& model, const Options& opt) {
     }
 
 
+    auto snap_and_resolve = [&]() {
+        for (long j = 0; j < E.total; ++j) {
+            if (st[j] == BASIC) continue;
+            if (st[j] == AT_LOWER && std::isfinite(E.lo[j]))
+                z[j] = E.lo[j];
+            else if (st[j] == AT_UPPER && std::isfinite(E.up[j]))
+                z[j] = E.up[j];
+        }
+        build_and_factor();
+        refresh_values();
+    };
+
     int rc1 = run_simplex(true);
     if (rc1 != 0) {
         sol.iterations = iter;
         sol.solve_time_ms = elapsed() * 1000.0;
         return sol;
     }
+    snap_and_resolve();
     {
         double bviol = 0.0;
         for (int i = 0; i < E.m; ++i)
@@ -566,6 +597,21 @@ Solution solve(const io::Model& model, const Options& opt) {
             if (E.kind[basis[i]] == KIND_ART) ++nb;
         std::fprintf(stderr, "[simplex] phase1 done iter=%ld arts_basic=%d\n",
                      iter, nb);
+        for (long j = 0; j < E.total; ++j) {
+            if (st[j] == BASIC) continue;
+            bool bad = (st[j] == AT_LOWER &&
+                        std::fabs(z[j] - E.lo[j]) > 1e-6 &&
+                        std::isfinite(E.lo[j])) ||
+                       (st[j] == AT_UPPER &&
+                        std::fabs(z[j] - E.up[j]) > 1e-6 &&
+                        std::isfinite(E.up[j]));
+            if (bad)
+                std::fprintf(stderr,
+                             "  [pre-driveout DESYNC] var=%ld kind=%d "
+                             "st=%u z=%.6g lo=%.6g up=%.6g\n",
+                             j, (int)E.kind[j], (unsigned)st[j], z[j],
+                             E.lo[j], E.up[j]);
+        }
     }
 
     for (int i = 0; i < E.m; ++i) {
@@ -619,15 +665,21 @@ Solution solve(const io::Model& model, const Options& opt) {
     }
     for (int j = 0; j < model.n; ++j) E.cost[j] = E.xs_cost[j];
 
-    int rc2 = run_simplex(false);
-    if (rc2 != 0) {
-        sol.iterations = iter;
-        sol.solve_time_ms = elapsed() * 1000.0;
-        return sol;
+    snap_and_resolve();
+    bool skip_phase2 = getenv("IGAOS_NO_PHASE2") != nullptr;
+    if (skip_phase2) {
+        build_and_factor();
+        refresh_values();
+    } else {
+        int rc2 = run_simplex(false);
+        if (rc2 != 0) {
+            sol.iterations = iter;
+            sol.solve_time_ms = elapsed() * 1000.0;
+            return sol;
+        }
     }
 
-    build_and_factor();
-    refresh_values();
+    snap_and_resolve();
     sol.x.assign(model.n, 0.0);
     for (int i = 0; i < E.m; ++i)
         if (E.kind[basis[i]] == KIND_X)
