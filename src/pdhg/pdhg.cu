@@ -113,10 +113,23 @@ Metrics evaluate(int m, int n, const std::vector<double>& rmin,
     for (int j = 0; j < n; ++j) mt.op += c[j] * x[j];
     double od = 0.0;
     bool bounded = true;
+    double cmax = 0.0;
+    for (double cj : c) cmax = std::max(cmax, std::fabs(cj));
+    const double dz = 1e-10 * (1.0 + cmax);
     for (int j = 0; j < n; ++j) {
-        double term = (d[j] >= 0) ? d[j] * cl[j] : d[j] * cu[j];
-        if (!std::isfinite(term)) { bounded = false; break; }
-        od += term;
+        if (d[j] >= 0) {
+            if (!std::isfinite(cl[j])) {
+                if (std::fabs(d[j]) > dz) { bounded = false; break; }
+                continue;
+            }
+            od += d[j] * cl[j];
+        } else {
+            if (!std::isfinite(cu[j])) {
+                if (std::fabs(d[j]) > dz) { bounded = false; break; }
+                continue;
+            }
+            od += d[j] * cu[j];
+        }
     }
     mt.od = bounded ? od : -INF;
     mt.gap = bounded ? std::fabs(mt.op - od) / (1.0 + std::fabs(mt.op)) : INF;
@@ -289,6 +302,15 @@ Solution solve(const io::Model& lp, const Options& opt) {
     Metrics last{};
     bool last_is_avg = false;
     long k = 1;
+    double best_err = INF_NAN;
+    int stag = 0;
+    double *d_xbest, *d_ybest;
+    CK(cudaMalloc(&d_xbest, n * sizeof(double)));
+    CK(cudaMalloc(&d_ybest, m * sizeof(double)));
+    CK(cudaMemcpy(d_xbest, d_x, n * sizeof(double),
+                  cudaMemcpyDeviceToDevice));
+    CK(cudaMemcpy(d_ybest, d_y, m * sizeof(double),
+                  cudaMemcpyDeviceToDevice));
     for (; k <= MAXIT; ++k) {
         iters_run = k;
         mvAT.mv(d_y, d_ata);
@@ -314,12 +336,59 @@ Solution solve(const io::Model& lp, const Options& opt) {
             Metrics mc, ma;
             metrics_of(d_x, d_y, mc);
             metrics_of(d_xavg, d_yavg, ma);
-            last = (mc.err() <= ma.err()) ? mc : ma;
-            last_is_avg = (ma.err() < mc.err());
+            double ec = mc.finite_res() ? mc.err() : INF_NAN;
+            double ea = ma.finite_res() ? ma.err() : INF_NAN;
+            last = (ec <= ea) ? mc : ma;
+            last_is_avg = (ea < ec);
             if (opt.verbosity > 0 && k % (CHECK * 40) == 0)
-                std::fprintf(stderr, "[pdhg] k=%ld pinf=%.3e dinf=%.3e\n", k,
-                             last.pinf, last.dinf);
-            if (last.err() <= TOL) break;
+                std::fprintf(stderr,
+                             "[pdhg] k=%ld pinf=%.3e dinf=%.3e gap=%.3e\n",
+                             k, last.pinf, last.dinf, last.gap);
+            bool res_ok = last.pinf <= TOL && last.dinf <= TOL;
+            bool gap_ok = std::isfinite(last.gap) && last.gap <= TOL;
+            if (res_ok && (!opt.restarts || gap_ok)) break;
+
+            if (opt.restarts) {
+            if (mc.pinf > 1e20 || !std::isfinite(mc.pinf)) {
+                CK(cudaMemcpy(d_x, d_xbest, n * sizeof(double),
+                              cudaMemcpyDeviceToDevice));
+                CK(cudaMemcpy(d_y, d_ybest, m * sizeof(double),
+                              cudaMemcpyDeviceToDevice));
+                tau = sigma = std::sqrt(ts);
+                stag = 0;
+            } else if (k >= 400 && ea < ec && ea <= 0.36 * best_err) {
+                CK(cudaMemcpy(d_x, d_xavg, n * sizeof(double),
+                              cudaMemcpyDeviceToDevice));
+                CK(cudaMemcpy(d_y, d_yavg, m * sizeof(double),
+                              cudaMemcpyDeviceToDevice));
+                CK(cudaMemcpy(d_xbest, d_x, n * sizeof(double),
+                              cudaMemcpyDeviceToDevice));
+                CK(cudaMemcpy(d_ybest, d_y, m * sizeof(double),
+                              cudaMemcpyDeviceToDevice));
+                best_err = ea;
+                tau = sigma = std::sqrt(ts);
+                wsum = 0.0;
+                stag = 0;
+            } else if (ec < best_err) {
+                best_err = ec;
+                CK(cudaMemcpy(d_xbest, d_x, n * sizeof(double),
+                              cudaMemcpyDeviceToDevice));
+                CK(cudaMemcpy(d_ybest, d_y, m * sizeof(double),
+                              cudaMemcpyDeviceToDevice));
+                stag = 0;
+            } else if (ec > 0.8 * best_err) {
+                if (++stag >= 40) {
+                    CK(cudaMemcpy(d_x, d_xbest, n * sizeof(double),
+                                  cudaMemcpyDeviceToDevice));
+                    CK(cudaMemcpy(d_y, d_ybest, m * sizeof(double),
+                                  cudaMemcpyDeviceToDevice));
+                    tau = sigma = std::sqrt(ts);
+                    wsum = 0.0;
+                    stag = 0;
+                }
+            }
+            }
+
             auto now = std::chrono::steady_clock::now();
             if (std::chrono::duration<double>(now - t0).count() >
                 opt.time_limit_s) {
@@ -329,15 +398,23 @@ Solution solve(const io::Model& lp, const Options& opt) {
             }
         }
     }
+    CK(cudaFree(d_xbest));
+    CK(cudaFree(d_ybest));
     double secs = std::chrono::duration<double>(
                       std::chrono::steady_clock::now() - t0)
                       .count();
 
     if (sol.status != Status::TimeLimit) {
-        if (last.err() <= TOL) {
+        bool res_ok = last.pinf <= TOL && last.dinf <= TOL;
+        bool gap_ok = std::isfinite(last.gap) && last.gap <= TOL;
+        if (res_ok && gap_ok) {
             sol.status = Status::NearOptimal;
-            sol.message = last_is_avg ? "converged on weighted-average iterate"
-                                      : "converged on current iterate";
+            sol.message = last_is_avg
+                              ? "converged (avg iterate): residuals + gap @tol"
+                              : "converged: residuals + gap @tol";
+        } else if (res_ok) {
+            sol.status = Status::Feasible;
+            sol.message = "residuals @tol; duality gap not certified";
         } else {
             sol.status = Status::IterationLimit;
             sol.message = "iteration cap reached before tolerance";

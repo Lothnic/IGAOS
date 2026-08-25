@@ -8,6 +8,7 @@ struct Options {
     long max_iterations = 500000;
     int seed = 0;
     bool presolve = true;
+    bool restarts = false;
     int verbosity = 0;
 };
 
