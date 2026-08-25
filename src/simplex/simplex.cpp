@@ -277,69 +277,31 @@ Solution solve(const io::Model& model, const Options& opt) {
             E.col_dense(enter0, ae);
             vector<double> alpha;
             lu.solve(ae, alpha);
-            if (opt.verbosity > 1)
-                std::fprintf(stderr,
-                             "[simplex] PRE it=%ld ph1=%d enter=%d dir=%+.0f "
-                             "score=%.3g kind=%d lo=%.4g up=%.4g\n",
-                             iter, (int)phase1, enter0, dir0, best_score,
-                             (int)E.kind[enter0], E.lo[enter0], E.up[enter0]);
-            if (opt.verbosity > 2) {
-                std::fprintf(stderr, "ALPHA:");
-                for (int i = 0; i < E.m; ++i)
-                    std::fprintf(stderr, " %.6g", alpha[i]);
-                std::fprintf(stderr, "\nZB:");
-                for (int i = 0; i < E.m; ++i)
-                    std::fprintf(stderr, " %.6g", zb[i]);
-                std::fprintf(stderr, "\n");
-                if (iter == 0)
-                    for (int i = 0; i < E.m; ++i)
-                        std::fprintf(stderr,
-                                     "  p%02d v%3ld k%d a%+8.4g z%+10.4f "
-                                     "l%.3g u%.3g\n",
-                                     i, basis[i], (int)E.kind[basis[i]],
-                                     alpha[i], zb[i],
-                                     E.lo[basis[i]] == -INF
-                                         ? -1e31
-                                         : E.lo[basis[i]],
-                                     E.up[basis[i]] == INF ? 1e31
-                                                           : E.up[basis[i]]);
-            }
-
+            double amax = 0.0;
+            for (double a : alpha) amax = std::max(amax, std::fabs(a));
 
             double theta = INF;
             int leave_pos = -1;
             double leave_bound = 0.0;
             bool leave_to_upper = false;
-            double best_pivot = 0.0;
-            for (int pass = 0; pass < 2; ++pass) {
-                if (pass == 1) {
-                    theta = INF;
-                    leave_pos = -1;
-                    best_pivot = 0.0;
-                }
-                double limit =
-                    pass == 0 ? INF : theta * (1.0 + 1e-9) + 1e-9;
+            double athr = 1e-9 * std::max(1.0, amax);
+            if (amax > 1e-9) {
                 for (int i = 0; i < E.m; ++i) {
-                    if (std::fabs(alpha[i]) <= 1e-11) continue;
+                    if (std::fabs(alpha[i]) <= athr) continue;
                     double rate = -alpha[i] * dir0;
                     double dist = rate > 0 ? (E.up[basis[i]] - zb[i])
                                            : (zb[i] - E.lo[basis[i]]);
                     if (!std::isfinite(dist)) continue;
                     if (dist < 0) dist = 0.0;
-                    double t = dist / std::fabs(rate);
-                    if (pass == 0) {
-                        if (t < theta) theta = t;
-                    } else if (t <= limit &&
-                               std::fabs(alpha[i]) > best_pivot) {
-                        best_pivot = std::fabs(alpha[i]);
+                    double t = std::fabs(dist / rate);
+                    if (!std::isfinite(theta) || t < theta) {
                         theta = t;
                         leave_pos = i;
                         leave_to_upper = rate > 0;
-                        leave_bound = rate > 0 ? E.up[basis[i]]
-                                               : E.lo[basis[i]];
+                        leave_bound =
+                            rate > 0 ? E.up[basis[i]] : E.lo[basis[i]];
                     }
                 }
-                if (pass == 0 && !std::isfinite(theta)) break;
             }
 
             double range = (st[enter0] == FREE_NB)
