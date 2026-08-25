@@ -392,7 +392,7 @@ Solution solve(const io::Model& model, const Options& opt) {
             bool leave_to_upper = false;
             const double ALPHA_FLOOR = 1e-9;
             const double DELTA = 1e-8;
-            const double STABILITY = 1e-4 * amax;
+            const double STABILITY = 1e-7 * amax;
             if (amax > ALPHA_FLOOR) {
                 for (int i = 0; i < E.m; ++i) {
                     if (std::fabs(alpha[i]) <= ALPHA_FLOOR) continue;
