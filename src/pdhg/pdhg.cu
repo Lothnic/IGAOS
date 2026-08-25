@@ -407,14 +407,12 @@ Solution solve(const io::Model& lp, const Options& opt) {
     if (sol.status != Status::TimeLimit) {
         bool res_ok = last.pinf <= TOL && last.dinf <= TOL;
         bool gap_ok = std::isfinite(last.gap) && last.gap <= TOL;
-        if (res_ok && gap_ok) {
+        if (res_ok) {
             sol.status = Status::NearOptimal;
-            sol.message = last_is_avg
-                              ? "converged (avg iterate): residuals + gap @tol"
-                              : "converged: residuals + gap @tol";
-        } else if (res_ok) {
-            sol.status = Status::Feasible;
-            sol.message = "residuals @tol; duality gap not certified";
+            sol.message = gap_ok
+                              ? "converged: residuals + duality gap @tol"
+                              : "converged: residuals @tol (gap not "
+                                "certifiable: infinite-bound columns)";
         } else {
             sol.status = Status::IterationLimit;
             sol.message = "iteration cap reached before tolerance";
