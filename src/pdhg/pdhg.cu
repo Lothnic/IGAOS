@@ -262,6 +262,9 @@ Solution solve(const io::Model& lp, const Options& opt) {
     const double TOL = opt.tolerance;
     long hn = 0;
     long since_restart = 0;
+    double epoch_r0 = -1.0;
+    int zbad_guard = 0;
+    (void)zbad_guard;
     long iters_run = 0;
     auto t0 = std::chrono::steady_clock::now();
 
@@ -348,13 +351,24 @@ Solution solve(const io::Model& lp, const Options& opt) {
             bool gap_ok = std::isfinite(last.gap) && last.gap <= TOL;
             if (res_ok && (!opt.restarts || gap_ok)) break;
 
-            if (++since_restart >= 2000 * CHECK / 25) {
+            double r_now = std::isfinite(ma.err()) ? ma.err()
+                                                   : INF_NAN;
+            if (epoch_r0 == INF_NAN) epoch_r0 = r_now;
+            bool kkt_restart =
+                std::isfinite(r_now) && r_now <= 0.3 * epoch_r0;
+            if (kkt_restart || ++since_restart >= 2000) {
                 hn = 0;
                 CK(cudaMemcpy(d_xavg, d_x, n * sizeof(double),
                               cudaMemcpyDeviceToDevice));
                 CK(cudaMemcpy(d_yavg, d_y, m * sizeof(double),
                               cudaMemcpyDeviceToDevice));
                 since_restart = 0;
+                if (kkt_restart && opt.verbosity > 1)
+                    std::fprintf(stderr,
+                                 "[pdhg] KKT restart @it=%ld r=%.3e\n",
+                                 iters_run, r_now);
+                epoch_r0 = INF_NAN;
+                zbad_guard = 0;
             }
             if (opt.restarts) {
             if (mc.pinf > 1e20 || !std::isfinite(mc.pinf)) {
