@@ -260,7 +260,8 @@ Solution solve(const io::Model& lp, const Options& opt) {
     const int CHECK = 25;
     long MAXIT = opt.max_iterations;
     const double TOL = opt.tolerance;
-    double wsum = 0.0;
+    long hn = 0;
+    long since_restart = 0;
     long iters_run = 0;
     auto t0 = std::chrono::steady_clock::now();
 
@@ -326,9 +327,8 @@ Solution solve(const io::Model& lp, const Options& opt) {
                                             d_ynew);
         std::swap(d_x, d_xnew);
         std::swap(d_y, d_ynew);
-        double wk = std::min((double)k, 500.0);
-        double weta = wk / (wsum + wk);
-        wsum += wk;
+        double weta = 2.0 / ((double)hn + 2.0);
+        ++hn;
         kern_mix<<<(n + 255) / 256, 256>>>(n, weta, d_x, d_xavg);
         kern_mix<<<(m + 255) / 256, 256>>>(m, weta, d_y, d_yavg);
 
@@ -348,6 +348,14 @@ Solution solve(const io::Model& lp, const Options& opt) {
             bool gap_ok = std::isfinite(last.gap) && last.gap <= TOL;
             if (res_ok && (!opt.restarts || gap_ok)) break;
 
+            if (++since_restart >= 2000 * CHECK / 25) {
+                hn = 0;
+                CK(cudaMemcpy(d_xavg, d_x, n * sizeof(double),
+                              cudaMemcpyDeviceToDevice));
+                CK(cudaMemcpy(d_yavg, d_y, m * sizeof(double),
+                              cudaMemcpyDeviceToDevice));
+                since_restart = 0;
+            }
             if (opt.restarts) {
             if (mc.pinf > 1e20 || !std::isfinite(mc.pinf)) {
                 CK(cudaMemcpy(d_x, d_xbest, n * sizeof(double),
@@ -367,7 +375,6 @@ Solution solve(const io::Model& lp, const Options& opt) {
                               cudaMemcpyDeviceToDevice));
                 best_err = ea;
                 tau = sigma = std::sqrt(ts);
-                wsum = 0.0;
                 stag = 0;
             } else if (ec < best_err) {
                 best_err = ec;
@@ -383,7 +390,6 @@ Solution solve(const io::Model& lp, const Options& opt) {
                     CK(cudaMemcpy(d_y, d_ybest, m * sizeof(double),
                                   cudaMemcpyDeviceToDevice));
                     tau = sigma = std::sqrt(ts);
-                    wsum = 0.0;
                     stag = 0;
                 }
             }
