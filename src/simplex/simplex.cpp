@@ -806,6 +806,25 @@ Solution solve(const io::Model& model, const Options& opt) {
     }
     snap_and_resolve();
     {
+        // Phase-1 optimum with positive artificials = infeasibility
+        // certificate (elastic phase 1 cannot drive row violations to
+        // zero). Without this check the art drive-out below silently
+        // pins infeasible arts to zero and the final original-model
+        // guard reports a bogus Error.
+        double asum = 0.0;
+        for (int i = 0; i < E.m; ++i)
+            if (E.kind[basis[i]] == KIND_ART)
+                asum += std::fabs(zb[i]);
+        if (asum > 1e-6 * (1.0 + E.cmax_x)) {
+            sol.status = Status::Infeasible;
+            sol.message = "infeasible: phase-1 optimum retains " +
+                          std::to_string(asum) + " artificial magnitude";
+            sol.iterations = iter;
+            sol.solve_time_ms = elapsed() * 1000.0;
+            return sol;
+        }
+    }
+    {
         double bviol = 0.0;
         for (int i = 0; i < E.m; ++i)
             bviol = std::max(bviol,

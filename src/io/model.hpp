@@ -24,6 +24,8 @@ struct Model {
     std::vector<double> acx;
     std::vector<unsigned char> integ;
     double obj_const = 0.0;  // RHS on objective row, sign-flipped per MPS
+    int n_fr_parsed = 0;     // FR bounds seen (robustness class-E asserts)
+    int n_ranges_parsed = 0; // RANGES entries consumed (class-D asserts)
 
     int nnz() const { return static_cast<int>(ax.size()); }
 };
@@ -134,6 +136,7 @@ inline void parse_mps(const std::string& path, Model& model) {
                 auto rit = rowidx.find(t[k]);
                 if (rit == rowidx.end() || rit->second < 0) continue;
                 ranges.emplace_back(rit->second, std::stod(t[k + 1]));
+                ++model.n_ranges_parsed;
             }
         } else if (section == "BOUNDS") {
             const std::string& type = t[0];
@@ -149,6 +152,7 @@ inline void parse_mps(const std::string& path, Model& model) {
             } else if (type == "FR") {
                 model.cl[j] = -INF;
                 model.cu[j] = INF;
+                ++model.n_fr_parsed;
             } else if (type == "MI") {
                 model.cl[j] = -INF;
             } else if (type == "PL") {

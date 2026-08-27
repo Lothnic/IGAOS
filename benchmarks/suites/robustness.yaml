@@ -1,0 +1,18 @@
+name: robustness
+acceptance_ladder: {solved: 1e-4, tight: 1e-6}   # CONTEXT.md "near-optimal" vocabulary
+instances:
+  - {id: sc50a,    class: B, tier: T0, mps: netlib_full/sc50a.mps,    expect: optimal,   z_ref: -6.4575077059e+01}
+  - {id: sc50b,    class: B, tier: T0, mps: netlib_full/sc50b.mps,    expect: optimal,   z_ref: -7.0e+01}
+  - {id: kb2,      class: A, tier: T0, mps: netlib_full/kb2.mps,      expect: optimal,   z_ref: -1.7499001299e+03}
+  - {id: klein1,   class: F, tier: T0, mps: netlib/infeas/klein1.mps,        expect: infeasible}
+  - {id: capri,    class: E, tier: T1, mps: netlib_full/capri.mps,    expect: optimal,   z_ref: 2.6900129138e+03, fr_cols: 14}
+  - {id: israel,   class: C, tier: T1, mps: netlib_full/israel.mps,   expect: optimal,   z_ref: -8.9664482186e+05}
+  - {id: modszk1,  class: A, tier: T2, mps: netlib_full/modszk1.mps,  expect: optimal,   z_ref: 3.2061972906e+02}
+  - {id: boeing1,  class: D, tier: T1, mps: netlib_full/boeing1.mps,  expect: optimal,   z_ref: -3.3521356751e+02, ranges: 89}
+  - {id: degen2,   class: A, tier: T2, mps: netlib_full/degen2.mps,   expect: optimal,   z_ref: -1.4351780000e+03}
+  - {id: pilot4,   class: E, tier: T2, mps: netlib_full/pilot4.mps,   expect: optimal,   z_ref: -2.5811392641e+03, fr_cols: 88}
+  - {id: refinery, class: F, tier: T2, mps: netlib/infeas/refinery.mps,      expect: infeasible}
+  - {id: pilot87,  class: C, tier: T3, mps: netlib_full/pilot87.mps,  expect: optimal,   z_ref: 3.0171072827e+02}
+  - {id: degen3,   class: A, tier: T3, mps: netlib_full/degen3.mps,   expect: optimal,   z_ref: -9.8729400000e+02}
+  - {id: nesm,     class: D, tier: T2, mps: netlib_full/nesm.mps,     expect: optimal,   z_ref: 1.4076073035e+07, ranges: 88}
+  - {id: klein3,   class: F, tier: T2, mps: netlib/infeas/klein3.mps,        expect: infeasible}

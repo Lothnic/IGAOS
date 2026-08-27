@@ -1,0 +1,16 @@
+instance,m,n,our_time_s,highs_time_s,our_objective,highs_objective,rel_gap,status,class,fr_parsed,ranges_parsed,verdict
+sc50a,,,0.00,0.01,-64.57507706,-64.57507706,1.55e-11,optimal,B,0,0,PASS
+sc50b,,,0.00,0.00,-70,-70,0.00e+00,optimal,B,0,0,PASS
+kb2,,,0.00,0.00,-1749.90013,-1749.90013,5.71e-11,optimal,A,0,0,PASS
+klein1,,,0.12,0.00,0,0,,infeasible,F,0,0,PASS
+capri,,,1.35,0.00,2690.012914,2690.012914,7.43e-11,optimal,E,14,0,PASS
+israel,,,0.33,0.00,-896644.8219,-896644.8219,4.46e-11,optimal,C,0,0,PASS
+modszk1,,,39.21,0.01,320.6197291,320.6197291,1.25e-10,optimal,A,2,0,PASS
+boeing1,,,3.93,0.01,-335.2135675,-335.2135675,2.98e-11,optimal,D,0,89,PASS
+degen2,,,300.01,0.01,0,-1435.178,1.00e+00,time-limit,A,0,0,FAIL
+pilot4,,,28.00,0.02,-2581.139259,-2581.139259,1.98e-09,optimal,E,88,0,FAIL
+refinery,,,1.61,0.00,0,95397904.89,,infeasible,F,0,0,PASS
+pilot87,,,4.23,2.29,0,301.7103473,1.00e+00,error,C,0,0,FAIL
+degen3,,,300.19,0.11,0,-987.294,1.00e+00,time-limit,A,0,0,FAIL
+nesm,,,63.37,0.10,14076036.49,14076036.49,2.60e-06,optimal,D,0,88,FAIL
+klein3,,,300.12,0.02,0,0,,time-limit,F,0,0,FAIL
