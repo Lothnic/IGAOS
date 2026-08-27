@@ -243,9 +243,18 @@ Solution solve(const io::Model& model, const Options& opt) {
     bool bland = false;
     bool perturbed = false;
     (void)perturbed;
+    // Columns blocked this basis: their only ratio-test blockers sit below
+    // the Harris stability threshold, so pivoting on them is numerically
+    // unsafe (observed: singular basis on perold). Skipped in pricing,
+    // cleared after every pivot/flip; if pricing exhausts anyway, the
+    // unsafe pivot is accepted as a last resort.
+    std::vector<char> skip_col(E.total, 0);
+    bool accept_unsafe = false;
     const int REFACTOR_EVERY = 64;
 
     auto run_simplex = [&](bool phase1) -> int {
+        std::fill(skip_col.begin(), skip_col.end(), 0);
+        accept_unsafe = false;
         auto verify_pivot_invariant = [&](const char* tag, int enter,
                                           int lpos, long lvar, double th,
                                           double dr) {
@@ -400,6 +409,7 @@ Solution solve(const io::Model& model, const Options& opt) {
             double dir0 = 1.0;
             for (long j = 0; j < E.total; ++j) {
                 if (st[j] == BASIC) continue;
+                if (skip_col[j]) continue;
                 if (std::isfinite(E.lo[j]) && std::isfinite(E.up[j]) &&
                     E.up[j] - E.lo[j] <= 1e-12)
                     continue;
@@ -424,6 +434,7 @@ Solution solve(const io::Model& model, const Options& opt) {
             if (enter0 < 0 && bland) {
                 for (long j = 0; j < E.total; ++j) {
                     if (st[j] == BASIC) continue;
+                    if (skip_col[j]) continue;
                     if (std::isfinite(E.lo[j]) && std::isfinite(E.up[j]) &&
                         E.up[j] - E.lo[j] <= 1e-12)
                         continue;
@@ -443,6 +454,17 @@ Solution solve(const io::Model& model, const Options& opt) {
                         dir0 = -1.0;
                         break;
                     }
+                }
+            }
+            if (enter0 < 0 && !skip_col.empty() && !accept_unsafe) {
+                bool any = false;
+                for (long j = 0; j < E.total && !any; ++j) any = skip_col[j];
+                if (any) {
+                    // every improving column is blocked below stability —
+                    // accept an unsafe pivot rather than stall
+                    accept_unsafe = true;
+                    std::fill(skip_col.begin(), skip_col.end(), 0);
+                    continue;
                 }
             }
             if (enter0 < 0) return 0;
@@ -550,6 +572,40 @@ Solution solve(const io::Model& model, const Options& opt) {
                         }
                     }
                 }
+                // Last-resort Harris fallback: the stability threshold
+                // (1e-7 * amax) filtered out every blocker, but pass 1 saw
+                // a finite ratio. Only safe to pivot here when the column
+                // cannot be skipped (pricing exhausted) — otherwise the
+                // column is rejected and pricing moves on.
+                if (leave_pos < 0 && std::isfinite(theta_rel) &&
+                    accept_unsafe) {
+                    double fb_abs = ALPHA_FLOOR;
+                    for (int i = 0; i < E.m; ++i) {
+                        if (std::fabs(alpha[i]) <= ALPHA_FLOOR) continue;
+                        double rate = -alpha[i] * dir0;
+                        bool to_upper = rate > 0;
+                        double dist = to_upper
+                                          ? (E.up[basis[i]] - zb[i])
+                                          : (zb[i] - E.lo[basis[i]]);
+                        if (!std::isfinite(dist)) continue;
+                        if (dist < 0) dist = 0.0;
+                        double bmag = std::fabs(
+                            to_upper ? E.up[basis[i]] : E.lo[basis[i]]);
+                        double relax = DELTA * (1.0 + bmag);
+                        double t_relaxed =
+                            (dist + relax) /
+                            (std::fabs(rate) * (1.0 + DELTA));
+                        if (t_relaxed <= theta_rel * (1.0 + 1e-9) + 1e-9 &&
+                            std::fabs(alpha[i]) >= fb_abs) {
+                            fb_abs = std::fabs(alpha[i]);
+                            leave_pos = i;
+                            leave_to_upper = to_upper;
+                            leave_bound = to_upper ? E.up[basis[i]]
+                                                   : E.lo[basis[i]];
+                        }
+                    }
+                }
+
                 if (leave_pos >= 0) {
                     double rate =
                         -alpha[leave_pos] * dir0;
@@ -570,6 +626,12 @@ Solution solve(const io::Model& model, const Options& opt) {
                                : (E.up[enter0] - E.lo[enter0]);
 
             if ((leave_pos < 0 || theta > range) && !std::isfinite(range)) {
+                if (std::isfinite(theta_rel) && !accept_unsafe) {
+                    // blocked (finite ratio exists) but no stable pivot —
+                    // reject this column, reprice
+                    skip_col[enter0] = 1;
+                    continue;
+                }
                 if (!retry_done) {
                     retry_done = true;
                     continue;
@@ -660,6 +722,9 @@ Solution solve(const io::Model& model, const Options& opt) {
                     degen_streak = 0;
                 }
             }
+            if (!skip_col.empty()) std::fill(skip_col.begin(),
+                                             skip_col.end(), 0);
+            accept_unsafe = false;
 
             if (flip) {
                 st[enter0] = (dir0 > 0) ? AT_UPPER : AT_LOWER;
@@ -875,6 +940,7 @@ Solution solve(const io::Model& model, const Options& opt) {
     sol.row_activity.assign(work.m, 0.0);
     double obj = 0.0;
     for (int j = 0; j < work.n; ++j) obj += work.c[j] * sol.x[j];
+    obj += work.obj_const;
     for (int i = 0; i < work.m; ++i) {
         sol.y[i] = E.sc.row[i] * ysc[i];
         for (int p = work.ap[i]; p < work.ap[i + 1]; ++p)

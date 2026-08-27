@@ -441,7 +441,7 @@ Solution solve(const io::Model& lp, const Options& opt) {
 
     const double* fx = last_is_avg ? d_xavg : d_x;
     const double* fy = last_is_avg ? d_yavg : d_y;
-    sol.objective = last.op;
+    sol.objective = last.op + lp.obj_const;
     sol.pinf = last.pinf;
     sol.dinf = last.dinf;
     sol.rel_gap = last.gap;

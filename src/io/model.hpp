@@ -23,6 +23,7 @@ struct Model {
     std::vector<int> cp, ci;
     std::vector<double> acx;
     std::vector<unsigned char> integ;
+    double obj_const = 0.0;  // RHS on objective row, sign-flipped per MPS
 
     int nnz() const { return static_cast<int>(ax.size()); }
 };
@@ -118,6 +119,12 @@ inline void parse_mps(const std::string& path, Model& model) {
             }
         } else if (section == "RHS") {
             for (size_t k = 1; k + 1 < t.size(); k += 2) {
+                // RHS on the objective row is a constant term, negated
+                // per MPS convention (c^T x - obj_const).
+                if (t[k] == objname) {
+                    model.obj_const -= std::stod(t[k + 1]);
+                    continue;
+                }
                 auto rit = rowidx.find(t[k]);
                 if (rit == rowidx.end() || rit->second < 0) continue;
                 rhs[rit->second] = std::stod(t[k + 1]);

@@ -63,5 +63,13 @@ print(f\"{n:<9} {d['solve_time_ms']:>12.0f} {ref[n]:>12.1f} {ratio:>8.0f}x {d['s
 done
 
 echo ""
+echo "--- MILP branch-and-bound (tiny_milp + knap25) --------------------"
+for m in tiny_milp knap25; do
+    f="demo/models/$m.mps"
+    echo ""
+    "$BIN" solve "$f" --engine milp --time-limit 20
+done
+
+echo ""
 echo "Honesty note: GPU wins live above ~1M-nnz instances; small LPs are"
 echo "CPU territory by design (crossover documented in docs/research/)."

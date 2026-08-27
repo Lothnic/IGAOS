@@ -107,7 +107,7 @@ Solution solve(const io::Model& model, const Options& opt) {
         sol.status == Status::IterationLimit) {
         if (has_incumbent) {
             sol.status = Status::Feasible;
-            sol.objective = best_obj;
+            sol.objective = best_obj + model.obj_const;
             sol.x = best_x;
             char b[128];
             std::snprintf(b, sizeof(b), "%ld nodes explored", nodes);
@@ -115,7 +115,7 @@ Solution solve(const io::Model& model, const Options& opt) {
         }
     } else if (has_incumbent) {
         sol.status = Status::Optimal;
-        sol.objective = best_obj;
+        sol.objective = best_obj + model.obj_const;
         sol.x = best_x;
         char b[128];
         std::snprintf(b, sizeof(b), "%ld nodes explored", nodes);
