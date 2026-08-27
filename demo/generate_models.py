@@ -23,6 +23,7 @@ class MPS:
         self.cols = {}
         self.rhs = {}
         self.bounds = []
+        self.quad = []  # (colname, colname, value) upper-triangular QUADOBJ
 
     def row(self, typ, name, rhs=0.0):
         self.rows.append((typ, name))
@@ -76,6 +77,10 @@ class MPS:
                     lines.append(f" {kind} BND {v}")
                 else:
                     lines.append(f" {kind} BND {v} {val:.14g}")
+        if self.quad:
+            lines.append("QUADOBJ")
+            for i, j, v in self.quad:
+                lines.append(f" {i} {j} {v:.14g}")
         lines.append("ENDATA")
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w") as f:
@@ -194,8 +199,8 @@ def williams():
     m.write(os.path.join(MODELS, "williams_refinery.mps"))
 
 
-def haverly(demand1, demand2, tag):
-    m = MPS(f"HAVERY{tag}_L0")
+def haverly(demand1, demand2, tag, quad=None, name_suffix="_l0"):
+    m = MPS(f"HAVERLY{tag}{name_suffix.upper()}")
 
     m.row("E", "PoolMass")
     for v, c in (("Y", 1.0), ("W", 1.0), ("XA", -1.0), ("XB", -1.0)):
@@ -270,12 +275,17 @@ def haverly(demand1, demand2, tag):
     m.bound("UP", "Y", float(demand1))
     m.bound("UP", "W", float(demand2))
 
-    m.write(os.path.join(MODELS, f"haverly{tag}_l0.mps"))
+    if quad:
+        lam = quad
+        m.quad.append(("P", "P", 2.0 * lam))
+    m.write(os.path.join(MODELS, f"haverly{tag}{name_suffix}.mps"))
 
 
 if __name__ == "__main__":
     williams()
     haverly(100, 200, "1")
     haverly(600, 800, "2")
+    haverly(100, 200, "1", quad=1.0, name_suffix="_l1")
+    haverly(600, 800, "2", quad=1.0, name_suffix="_l1")
     for f in sorted(os.listdir(MODELS)):
         print(f, os.path.getsize(os.path.join(MODELS, f)))

@@ -26,6 +26,12 @@ struct Model {
     double obj_const = 0.0;  // RHS on objective row, sign-flipped per MPS
     int n_fr_parsed = 0;     // FR bounds seen (robustness class-E asserts)
     int n_ranges_parsed = 0; // RANGES entries consumed (class-D asserts)
+    // Quadratic objective (upper-triangular COO): 0.5 x'Px with
+    // off-diagonals counted once here and doubled on assembly.
+    std::vector<int> q_i, q_j;
+    std::vector<double> q_v;
+
+    bool has_quadratic() const { return !q_v.empty(); }
 
     int nnz() const { return static_cast<int>(ax.size()); }
 };
@@ -137,6 +143,19 @@ inline void parse_mps(const std::string& path, Model& model) {
                 if (rit == rowidx.end() || rit->second < 0) continue;
                 ranges.emplace_back(rit->second, std::stod(t[k + 1]));
                 ++model.n_ranges_parsed;
+            }
+        } else if (section == "QUADOBJ" || section == "QSECTION" ||
+                   section == "QMATRIX") {
+            // Data lines: col col value (upper-triangular for
+            // QUADOBJ/QSECTION; QMATRIX may repeat symmetric entries —
+            // later duplicates add).
+            for (size_t k = 0; k + 2 < t.size(); k += 3) {
+                auto ci1 = colidx.find(t[k]);
+                auto ci2 = colidx.find(t[k + 1]);
+                if (ci1 == colidx.end() || ci2 == colidx.end()) continue;
+                model.q_i.push_back(ci1->second);
+                model.q_j.push_back(ci2->second);
+                model.q_v.push_back(std::stod(t[k + 2]));
             }
         } else if (section == "BOUNDS") {
             const std::string& type = t[0];

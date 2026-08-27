@@ -1,5 +1,5 @@
 add_executable(igaos igaos_cli.cpp)
-target_link_libraries(igaos PRIVATE igaos_io igaos_simplex igaos_milp)
+target_link_libraries(igaos PRIVATE igaos_io igaos_simplex igaos_milp igaos_qp)
 target_include_directories(igaos PRIVATE ${CMAKE_SOURCE_DIR}/include)
 
 if(IGAOS_HAVE_PDHG)
@@ -13,7 +13,7 @@ if(pybind11_FOUND)
     # Target name differs from the CLI executable; OUTPUT_NAME makes the
     # built file import as `igaos` (matches PYBIND11_MODULE name).
     pybind11_add_module(igaos_py ${CMAKE_SOURCE_DIR}/python/igaos_bindings.cpp)
-    target_link_libraries(igaos_py PRIVATE igaos_io igaos_simplex igaos_milp)
+    target_link_libraries(igaos_py PRIVATE igaos_io igaos_simplex igaos_milp igaos_qp)
     target_include_directories(igaos_py PRIVATE ${CMAKE_SOURCE_DIR}/src/api)
     if(IGAOS_HAVE_PDHG)
         target_link_libraries(igaos_py PRIVATE igaos_pdhg)

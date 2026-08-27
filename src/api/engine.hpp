@@ -10,6 +10,7 @@
 #include "igaos/status.h"
 #include "model.hpp"
 #include "milp.hpp"
+#include "qp.hpp"
 #include "simplex.hpp"
 #ifdef IGAOS_HAS_PDHG
 #include "pdhg.hpp"
@@ -23,8 +24,7 @@ inline Solution solve_with_engine(const io::Model& model,
                                   const std::string& engine) {
     Solution sol;
     if (engine == "qp") {
-        sol.status = Status::Error;
-        sol.message = "engine not yet wired: qp";
+        sol = qp::solve(model, opts);
     } else if (engine == "milp") {
         sol = milp::solve(model, opts);
     } else if (engine == "simplex") {
