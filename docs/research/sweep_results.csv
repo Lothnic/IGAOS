@@ -127,3 +127,6 @@ vtp.base,198,203,HiGHS,Optimal,129831.4625,0.8,ref
 vtp.base,198,203,IGAOS-simplex,optimal,129831.4625,786.8,exact
 wood1p,244,2594,HiGHS,Optimal,1.442902412,41.3,ref
 wood1p,244,2594,IGAOS-simplex,error,0,355.2,MISMATCH
+# 2026-08-28 rerun after false-ray fix + obj_const fix (commits 4c49d09..): pilot4 unbounded->optimal exact; e226 objective corrected by +7.113 obj_const
+pilot4,410,1000,IGAOS-simplex,optimal,-2581.139259,29418.0,exact
+e226,223,289,IGAOS-simplex,optimal,-11.63892907,1441.0,exact

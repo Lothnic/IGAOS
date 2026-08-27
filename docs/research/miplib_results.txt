@@ -1,0 +1,22 @@
+hanoi5       ref[=opt=]=1931.0             IGA[Timeout]=nan                   90.0s  n/a
+gt2          ref[=opt=]=21165.99999999978  IGA[feasible]=74342                 60.0s  MISMATCH  (55522 nodes / 55521 LPs explored)
+p0201        ref[=opt=]=7614.999999999997  IGA[feasible]=8055                  60.0s  MISMATCH  (605 nodes / 600 LPs explored)
+mod010       ref[=opt=]=6548.0             IGA[time-limit]=0                     60.0s  MISMATCH  (wall-clock budget exhausted)
+flugpl       ref[=opt=]=1201500.0          IGA[optimal]=1201500                4.9s  exact  (21299 nodes / 21299 LPs explored)
+air03        ref[=opt=]=340160.0           IGA[time-limit]=0                     70.4s  MISMATCH  (wall-clock budget exhausted)
+blend2       ref[=opt=]=7.598985           IGA[feasible]=10.404006             60.1s  MISMATCH  (140 nodes / 139 LPs explored)
+ran12x21     ref[=opt=]=3663.999999980964  IGA[feasible]=4184                  60.4s  MISMATCH  (70 nodes / 70 LPs explored)
+ran13x13     ref[=opt=]=3252.0             IGA[feasible]=3654                  60.0s  MISMATCH  (240 nodes / 240 LPs explored)
+misc07       ref[=opt=]=2810.0             IGA[feasible]=2920                  60.7s  MISMATCH  (70 nodes / 70 LPs explored)
+dsbmip       ref[=opt=]=-305.19817501      IGA[time-limit]=0                     60.0s  MISMATCH  (wall-clock budget exhausted)
+khb05250     ref[=opt=]=106940225.9999999  IGA[feasible]=107439535             60.1s  MISMATCH  (324 nodes / 323 LPs explored)
+cap6000      ref[=opt=]=-2451377.0         IGA[time-limit]=0                     60.1s  MISMATCH  (wall-clock budget exhausted)
+acc-tight2   ref[=opt=]=0.0                IGA[time-limit]=0                     60.1s  exact  (wall-clock budget exhausted)
+aflow30a     ref[=opt=]=1158.0             IGA[time-limit]=0                     62.4s  MISMATCH  (wall-clock budget exhausted)
+10teams      ref[=opt=]=923.9999999999997  IGA[time-limit]=0                     63.8s  MISMATCH  (wall-clock budget exhausted)
+mas76        ref[=opt=]=40005.05398999999  IGA[feasible]=40878.97793           60.0s  MISMATCH  (29244 nodes / 29244 LPs explored)
+noswot       ref[=opt=]=-41.00000885       IGA[feasible]=-36                   60.0s  MISMATCH  (2695 nodes / 2695 LPs explored)
+stein45inf   ref[=inf=]=None               IGA[time-limit]=0                     60.0s  n/a  (wall-clock budget exhausted)
+timtab1      ref[=opt=]=764771.99999978    IGA[time-limit]=0                     60.1s  MISMATCH  (wall-clock budget exhausted)
+
+2/20 matched solufile @<=1e-4
