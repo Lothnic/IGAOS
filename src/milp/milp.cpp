@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <set>
 #include <vector>
 
 namespace igaos::milp {
@@ -35,20 +36,74 @@ Solution solve(const io::Model& model, const Options& opt) {
     double best_obj = INF;
     std::vector<double> best_x;
     bool has_incumbent = false;
-    long nodes = 0;
+    long nodes = 0, solves = 0, lp_failures = 0;
 
+    // best-bound + dive (#19): before any incumbent exists we dive
+    // (deepest node) to reach integer feasibility fast; afterwards the
+    // best-bound node is popped to close the proof. Nodes live in a pool;
+    // the dive stack and bound multiset hold indices, dead entries are
+    // skipped lazily.
     struct Node {
         std::vector<double> cl, cu;
+        double bound;
+        int depth;
+        bool alive = true;
     };
-    std::vector<Node> stack;
+    std::vector<Node> pool;
+    std::vector<int> dive;  // LIFO stack of pool indices
+    // ponytail: index multiset bound-major — fine to 1e5 nodes; a pairing
+    // heap if node counts grow 100x
+    auto bound_worse = [&](int a, int b) {
+        if (pool[a].bound != pool[b].bound) return pool[a].bound > pool[b].bound;
+        return pool[a].depth < pool[b].depth;
+    };
+    std::multiset<int, decltype(bound_worse)> by_bound(bound_worse);
+
+    auto push_node = [&](Node&& nd) {
+        pool.push_back(std::move(nd));
+        int idx = (int)pool.size() - 1;
+        dive.push_back(idx);
+        by_bound.insert(idx);
+    };
+
     Node root;
     root.cl = model.cl;
     root.cu = model.cu;
-    stack.push_back(root);
+    root.bound = -INF;
+    root.depth = 0;
+    push_node(std::move(root));
 
     const double INT_TOL = 1e-6;
+    const double GAP_TOL = 1e-9;  // bound pruning epsilon
 
-    while (!stack.empty()) {
+    auto pop_node = [&]() -> int {
+        auto try_dive = [&]() -> int {
+            while (!dive.empty()) {
+                int idx = dive.back();
+                dive.pop_back();
+                if (pool[idx].alive) return idx;
+            }
+            return -1;
+        };
+        auto try_bound = [&]() -> int {
+            while (!by_bound.empty()) {
+                int idx = *by_bound.begin();
+                by_bound.erase(by_bound.begin());
+                if (pool[idx].alive) return idx;
+            }
+            return -1;
+        };
+        // primary rule per #19 (dive before incumbent, best-bound after),
+        // but never abandon live nodes in the other container
+        if (!has_incumbent) {
+            int i = try_dive();
+            return i >= 0 ? i : try_bound();
+        }
+        int i = try_bound();
+        return i >= 0 ? i : try_dive();
+    };
+
+    while (true) {
         if (elapsed() > opt.time_limit_s) {
             sol.status = Status::TimeLimit;
             sol.message = "wall-clock budget exhausted";
@@ -59,19 +114,31 @@ Solution solve(const io::Model& model, const Options& opt) {
             sol.message = "node cap reached";
             break;
         }
-        Node nd = stack.back();
-        stack.pop_back();
+        int idx = pop_node();
+        if (idx < 0) break;
+        Node nd = pool[idx];  // by value: push_node may reallocate the pool
+        pool[idx].alive = false;
+        by_bound.erase(idx);
         ++nodes;
+
+        // prune on inherited bound before paying for an LP solve
+        if (has_incumbent && nd.bound > best_obj - GAP_TOL) continue;
 
         io::Model lp = model;
         lp.cl = nd.cl;
         lp.cu = nd.cu;
         for (int j : ivars) lp.integ[j] = 0;
 
+        ++solves;
         Solution r = simplex::solve(lp, opt);
         if (r.status != Status::Optimal && r.status != Status::NearOptimal &&
-            r.status != Status::Feasible)
+            r.status != Status::Feasible) {
+            ++lp_failures;
             continue;
+        }
+
+        // LP bound from this node's own relaxation
+        if (has_incumbent && r.objective > best_obj - GAP_TOL) continue;
 
         int frac_var = -1;
         double frac_dist = INT_TOL;
@@ -84,15 +151,17 @@ Solution solve(const io::Model& model, const Options& opt) {
         }
 
         if (frac_var >= 0) {
-            if (has_incumbent && r.objective > best_obj - 1e-9) continue;
             double fl = std::floor(r.x[frac_var]);
             Node down = nd, upn = nd;
             down.cu[frac_var] = std::min(nd.cu[frac_var], fl);
+            down.bound = r.objective;
             upn.cl[frac_var] = std::max(nd.cl[frac_var], fl + 1.0);
+            upn.bound = r.objective;
+            down.depth = upn.depth = nd.depth + 1;
             if (down.cl[frac_var] <= down.cu[frac_var])
-                stack.push_back(down);
+                push_node(std::move(down));
             if (upn.cl[frac_var] <= upn.cu[frac_var])
-                stack.push_back(upn);
+                push_node(std::move(upn));
             continue;
         }
 
@@ -103,25 +172,27 @@ Solution solve(const io::Model& model, const Options& opt) {
         }
     }
 
+    char b[160];
+    std::snprintf(b, sizeof(b), "%ld nodes / %ld LPs explored", nodes, solves);
     if (sol.status == Status::TimeLimit ||
         sol.status == Status::IterationLimit) {
         if (has_incumbent) {
             sol.status = Status::Feasible;
             sol.objective = best_obj + model.obj_const;
             sol.x = best_x;
-            char b[128];
-            std::snprintf(b, sizeof(b), "%ld nodes explored", nodes);
             sol.message = b;
         }
     } else if (has_incumbent) {
         sol.status = Status::Optimal;
         sol.objective = best_obj + model.obj_const;
         sol.x = best_x;
-        char b[128];
-        std::snprintf(b, sizeof(b), "%ld nodes explored", nodes);
         sol.message = b;
-    } else if (sol.status != Status::TimeLimit &&
-               sol.status != Status::IterationLimit) {
+    } else if (lp_failures > 0) {
+        // LP engine failed on open nodes — not a proof of infeasibility
+        sol.status = Status::Error;
+        sol.message = std::string(b) + "; " + std::to_string(lp_failures) +
+                      " node LPs unsolved";
+    } else {
         sol.status = Status::Infeasible;
         sol.message = "no integer-feasible solution found";
     }
