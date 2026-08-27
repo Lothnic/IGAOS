@@ -9,12 +9,8 @@
 #include "igaos/options.h"
 #include "igaos/solution.h"
 #include "igaos/status.h"
+#include "engine.hpp"
 #include "model.hpp"
-#include "milp.hpp"
-#include "simplex.hpp"
-#ifdef IGAOS_HAS_PDHG
-#include "pdhg.hpp"
-#endif
 
 using igaos::io::Model;
 
@@ -178,6 +174,8 @@ int cmd_info(const Model& mdl) {
     std::printf("col bounds     free=%d fixed=%d boxed=%d one-sided=%d\n",
                 nfree, nfixed, nboxed, nupper);
     std::printf("objective      |c|max=%.6g\n", cnz_max);
+    std::printf("parsed         FR=%d RANGES=%d obj_const=%.6g\n",
+                mdl.n_fr_parsed, mdl.n_ranges_parsed, mdl.obj_const);
     return 0;
 }
 
@@ -206,26 +204,7 @@ int main(int argc, char** argv) {
     }
     if (a.cmd == "info") return cmd_info(mdl);
 
-    igaos::Solution sol;
-    if (a.engine == "qp") {
-        sol.status = igaos::Status::Error;
-        sol.message = "engine not yet wired: qp";
-    } else if (a.engine == "milp") {
-        sol = igaos::milp::solve(mdl, a.opts);
-    } else if (a.engine == "simplex") {
-        sol = igaos::simplex::solve(mdl, a.opts);
-    } else if (a.engine == "pdhg") {
-#ifdef IGAOS_HAS_PDHG
-        sol = igaos::pdhg::solve(mdl, a.opts);
-#else
-        sol.status = igaos::Status::Error;
-        sol.message = "built without CUDA: PDHG engine unavailable";
-#endif
-    } else {
-        sol = igaos::simplex::solve(mdl, a.opts);
-        if (sol.status == igaos::Status::Error)
-            sol.message += "; auto fallback failed";
-    }
+    igaos::Solution sol = igaos::solve_with_engine(mdl, a.opts, a.engine);
     emit_json(mdl, sol, a.model_path, a.engine, a.out_path);
     return 0;
 }
