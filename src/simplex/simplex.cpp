@@ -336,7 +336,6 @@ Solution solve(const io::Model& model, const Options& opt,
     int degen_streak = 0;
     bool bland = false;
     bool perturbed = false;
-    (void)perturbed;
     // Columns blocked this basis: their only ratio-test blockers sit below
     // the Harris stability threshold, so pivoting on them is numerically
     // unsafe (observed: singular basis on perold). Skipped in pricing,
@@ -408,6 +407,12 @@ Solution solve(const io::Model& model, const Options& opt,
                          z[enter]);
         };
         bool retry_done = false;
+        // pivot-recovery snapshot: last (basis, st) before the most recent
+        // basis-changing pivot, plus the entering column — used to roll
+        // back a pivot whose basis turns out singular at refactorization
+        vector<int> rec_basis;
+        vector<unsigned char> rec_st;
+        int rec_enter = -1;
         for (; iter <= opt.max_iterations; ++iter) {
             {
                 for (long j = 0; j < E.total; ++j) {
@@ -422,6 +427,15 @@ Solution solve(const io::Model& model, const Options& opt,
                 }
 
                 if (!build_and_factor()) {
+                    if (rec_enter >= 0) {
+                        // the last pivot singularized the basis — roll it
+                        // back and reject that entering column
+                        basis = rec_basis;
+                        st = rec_st;
+                        skip_col[rec_enter] = 1;
+                        rec_enter = -1;
+                        continue;
+                    }
                     sol.status = Status::Error;
                     sol.message = "basis factorization failed";
                     return 5;
@@ -815,6 +829,19 @@ Solution solve(const io::Model& model, const Options& opt,
                     bland = true;
                     degen_streak = 0;
                 }
+                // deep stall: even Bland is not escaping — perturb costs
+                // once (HiGHS-recipe flavor, robustness-strategy rung 4);
+                // the post-solve cleanup pass restores them
+                if (degen_streak >= 500 && !perturbed && !phase1) {
+                    perturbed = true;
+                    degen_streak = 0;
+                    for (int j = 0; j < E.nx; ++j) {
+                        if (E.cost[j] == 0.0) continue;
+                        double mag = std::fabs(E.cost[j]);
+                        double r = (double)rng() / (double)rng.max() - 0.5;
+                        E.cost[j] += r * 1e-5 * mag;
+                    }
+                }
             }
             if (!skip_col.empty()) std::fill(skip_col.begin(),
                                              skip_col.end(), 0);
@@ -828,6 +855,10 @@ Solution solve(const io::Model& model, const Options& opt,
             }
 
             int leaving = basis[leave_pos];
+            // snapshot for pivot rollback (see factor-failure recovery)
+            rec_basis = basis;
+            rec_st = st;
+            rec_enter = enter0;
             z[leaving] = leave_bound;
             st[leaving] = leave_to_upper ? AT_UPPER : AT_LOWER;
             basis[leave_pos] = enter0;
@@ -1019,6 +1050,19 @@ Solution solve(const io::Model& model, const Options& opt,
             sol.iterations = iter;
             sol.solve_time_ms = elapsed() * 1000.0;
             return sol;
+        }
+        if (perturbed) {
+            // cleanup pass: restore true costs and re-optimize from the
+            // perturbed optimum (bounded damage — the perturbed point is
+            // near-optimal, so few pivots)
+            for (int j = 0; j < E.nx; ++j) E.cost[j] = E.xs_cost[j];
+            perturbed = false;
+            int rc3 = run_simplex(false);
+            if (rc3 != 0) {
+                sol.iterations = iter;
+                sol.solve_time_ms = elapsed() * 1000.0;
+                return sol;
+            }
         }
     }
 
