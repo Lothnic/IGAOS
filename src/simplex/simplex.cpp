@@ -106,7 +106,8 @@ struct Engine {
 
 }  // namespace
 
-Solution solve(const io::Model& model, const Options& opt) {
+Solution solve(const io::Model& model, const Options& opt,
+               const WarmStart* warm, WarmStart* warm_out) {
     Solution sol;
     auto t0 = std::chrono::steady_clock::now();
     auto elapsed = [&]() {
@@ -174,26 +175,119 @@ Solution solve(const io::Model& model, const Options& opt) {
     vector<unsigned char> st((size_t)work.n + work.m, AT_LOWER);
     vector<double> z((size_t)work.n + work.m, 0.0);
 
-    for (int j = 0; j < work.n; ++j) {
-        if (std::isfinite(E.lo[j])) { st[j] = AT_LOWER; z[j] = E.lo[j]; }
-        else if (std::isfinite(E.up[j])) { st[j] = AT_UPPER; z[j] = E.up[j]; }
-        else { st[j] = FREE_NB; z[j] = 0.0; }
+    // Warm-start restore: reuse a parent solve's basis/states for a model
+    // with the same matrix (B&B child, bounds-only difference). Basics
+    // violating the child bounds are snapped to the violated bound and
+    // their slots become artificials — the existing elastic phase 1 then
+    // restores feasibility from a nearly-good basis.
+    bool warm_ok = warm != nullptr &&
+                   (int)warm->basis.size() == work.m &&
+                   (int)warm->nb_state.size() == work.n + work.m;
+    if (warm_ok) {
+        for (int i = 0; i < work.m; ++i) {
+            long v = warm->basis[i];
+            basis[i] = (v >= 0 && v < (long)(work.n + work.m)) ? (int)v : -1;
+        }
+        // nonbasic states from snapshot; z recomputed from bounds so the
+        // child's tighter bounds are honored
+        for (long j = 0; j < (long)(work.n + work.m); ++j) {
+            bool in_basis = false;
+            for (int i = 0; i < work.m && !in_basis; ++i)
+                in_basis = basis[i] == (int)j;
+            if (in_basis) { st[j] = BASIC; continue; }
+            unsigned char s = warm->nb_state[j];
+            st[j] = s;
+            if (s == AT_LOWER && std::isfinite(E.lo[j])) z[j] = E.lo[j];
+            else if (s == AT_UPPER && std::isfinite(E.up[j])) z[j] = E.up[j];
+            else if (!std::isfinite(E.lo[j]) && std::isfinite(E.up[j]))
+                { st[j] = AT_UPPER; z[j] = E.up[j]; }
+            else if (std::isfinite(E.lo[j])) { st[j] = AT_LOWER; z[j] = E.lo[j]; }
+            else { st[j] = FREE_NB; z[j] = 0.0; }
+        }
+        // evaluate basic values via a factorization of the restored basis
+        DenseLU wlu;
+        {
+            vector<double> Bm((size_t)E.m * E.m, 0.0), col;
+            for (int c = 0; c < E.m; ++c) {
+                if (basis[c] < 0) { Bm[(size_t)c * E.m + c] = 1.0; continue; }
+                E.basis_col(basis[c], col);
+                for (int r = 0; r < E.m; ++r)
+                    if (col[r] != 0.0) Bm[(size_t)r * E.m + c] = col[r];
+            }
+            wlu.factor(std::move(Bm));
+        }
+        if (!wlu.ok) {
+            warm_ok = false;  // singular restored basis — fall back cold
+        } else {
+            vector<double> wzb(work.m, 0.0);
+            {
+                vector<double> rhs(work.m, 0.0);
+                for (long j = 0; j < (long)(work.n + work.m); ++j) {
+                    if (st[j] == BASIC || z[j] == 0.0) continue;
+                    E.accumulate_row_rhs((int)j, z[j], rhs);
+                }
+                wlu.solve(rhs, wzb);
+            }
+            for (int i = 0; i < work.m; ++i) {
+                int v = basis[i];
+                if (v < 0) continue;
+                double val = wzb[i];
+                if (val < E.lo[v]) {
+                    st[v] = AT_LOWER; z[v] = E.lo[v]; basis[i] = -1;
+                } else if (val > E.up[v]) {
+                    st[v] = AT_UPPER; z[v] = E.up[v]; basis[i] = -1;
+                } else {
+                    z[v] = val;
+                }
+            }
+            // re-validate the augmented basis: snapped slots will become
+            // art columns (+e_i), and replacing a basis column by e_i can
+            // be singular even when the original was not
+            {
+                vector<double> Bm((size_t)E.m * E.m, 0.0), col;
+                for (int c = 0; c < E.m; ++c) {
+                    if (basis[c] < 0) { Bm[(size_t)c * E.m + c] = 1.0; continue; }
+                    E.basis_col(basis[c], col);
+                    for (int r = 0; r < E.m; ++r)
+                        if (col[r] != 0.0) Bm[(size_t)r * E.m + c] = col[r];
+                }
+                DenseLU chk;
+                chk.factor(std::move(Bm));
+                if (!chk.ok) warm_ok = false;
+            }
+        }
+    }
+    if (!warm_ok) {
+        for (int j = 0; j < work.n; ++j) {
+            if (std::isfinite(E.lo[j])) { st[j] = AT_LOWER; z[j] = E.lo[j]; }
+            else if (std::isfinite(E.up[j])) { st[j] = AT_UPPER; z[j] = E.up[j]; }
+            else { st[j] = FREE_NB; z[j] = 0.0; }
+        }
+        vector<double> ax_val(work.m, 0.0);
+        for (int j = 0; j < work.n; ++j)
+            if (z[j] != 0.0)
+                for (int p = E.cp[j]; p < E.cp[j + 1]; ++p)
+                    ax_val[E.ci[p]] += E.cv[p] * z[j];
+
+        for (int i = 0; i < work.m; ++i) {
+            int sv = work.n + i;
+            if (ax_val[i] < E.lo[sv]) { st[sv] = AT_LOWER; z[sv] = E.lo[sv]; }
+            else if (ax_val[i] > E.up[sv]) { st[sv] = AT_UPPER; z[sv] = E.up[sv]; }
+            else { st[sv] = BASIC; basis[i] = sv; z[sv] = ax_val[i]; }
+        }
     }
     vector<double> ax_val(work.m, 0.0);
-    for (int j = 0; j < work.n; ++j)
-        if (z[j] != 0.0)
-            for (int p = E.cp[j]; p < E.cp[j + 1]; ++p)
-                ax_val[E.ci[p]] += E.cv[p] * z[j];
-
-    for (int i = 0; i < work.m; ++i) {
-        int sv = work.n + i;
-        if (ax_val[i] < E.lo[sv]) { st[sv] = AT_LOWER; z[sv] = E.lo[sv]; }
-        else if (ax_val[i] > E.up[sv]) { st[sv] = AT_UPPER; z[sv] = E.up[sv]; }
-        else { st[sv] = BASIC; basis[i] = sv; z[sv] = ax_val[i]; }
+    if (!warm_ok) {
+        for (int j = 0; j < work.n; ++j)
+            if (z[j] != 0.0)
+                for (int p = E.cp[j]; p < E.cp[j + 1]; ++p)
+                    ax_val[E.ci[p]] += E.cv[p] * z[j];
     }
     for (int i = 0; i < work.m; ++i) {
         if (basis[i] >= 0) continue;
-        double rho = ax_val[i] - z[work.n + i];
+        // warm path: art value is a placeholder, recomputed by the
+        // refresh right after factorization
+        double rho = warm_ok ? 0.0 : ax_val[i] - z[work.n + i];
         E.art_row.push_back(i);
         E.art_sigma.push_back(rho > 0 ? -1.0 : 1.0);
         int av_idx = (int)E.kind.size();
@@ -1029,6 +1123,15 @@ Solution solve(const io::Model& model, const Options& opt) {
                             : "optimal";
     sol.iterations = iter;
     sol.solve_time_ms = elapsed() * 1000.0;
+    if (warm_out != nullptr && sol.status == Status::Optimal) {
+        // snapshot: structural+slack basis slots (arts recorded as -1 —
+        // restore treats them as empty slots) and nonbasic states
+        warm_out->basis.assign(work.m, -1);
+        for (int i = 0; i < work.m; ++i)
+            if (basis[i] < work.n + work.m) warm_out->basis[i] = basis[i];
+        warm_out->nb_state.assign(st.begin(),
+                                  st.begin() + (work.n + work.m));
+    }
     return sol;
 }
 

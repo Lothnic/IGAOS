@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <set>
 #include <vector>
 
@@ -48,6 +49,8 @@ Solution solve(const io::Model& model, const Options& opt) {
         double bound;
         int depth;
         bool alive = true;
+        simplex::WarmStart warm;      // parent's final basis (empty = cold)
+        bool warm_valid = false;
     };
     std::vector<Node> pool;
     std::vector<int> dive;  // LIFO stack of pool indices
@@ -130,7 +133,22 @@ Solution solve(const io::Model& model, const Options& opt) {
         for (int j : ivars) lp.integ[j] = 0;
 
         ++solves;
-        Solution r = simplex::solve(lp, opt);
+        simplex::WarmStart child_warm;
+        bool warm_here = nd.warm_valid &&
+                         std::getenv("IGAOS_NO_WARM") == nullptr;
+        Solution r = simplex::solve(lp, opt, warm_here ? &nd.warm : nullptr,
+                                    &child_warm);
+        if (warm_here && (r.status == Status::Error ||
+                          r.status == Status::Infeasible)) {
+            // Warm starts land primal-infeasible (child bounds); the
+            // art-based phase 1 cannot always repair basic bound
+            // violations. Failures are loud (Error) or untrustworthy
+            // (Infeasible from a bogus phase-1 optimum) — fall back to a
+            // cold solve; warm still pays off on the nodes it completes.
+            r = simplex::solve(lp, opt, nullptr, &child_warm);
+        }
+        bool child_warm_valid =
+            r.status == Status::Optimal && !child_warm.basis.empty();
         if (r.status != Status::Optimal && r.status != Status::NearOptimal &&
             r.status != Status::Feasible) {
             ++lp_failures;
@@ -158,6 +176,8 @@ Solution solve(const io::Model& model, const Options& opt) {
             upn.cl[frac_var] = std::max(nd.cl[frac_var], fl + 1.0);
             upn.bound = r.objective;
             down.depth = upn.depth = nd.depth + 1;
+            down.warm = upn.warm = child_warm;
+            down.warm_valid = upn.warm_valid = child_warm_valid;
             if (down.cl[frac_var] <= down.cu[frac_var])
                 push_node(std::move(down));
             if (upn.cl[frac_var] <= upn.cu[frac_var])

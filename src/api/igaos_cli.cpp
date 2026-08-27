@@ -36,6 +36,8 @@ void usage() {
 
 struct Args {
     std::string cmd, model_path, out_path, engine = "auto";
+    std::string warm_from;  // debug: solve this model first, warm-start from it
+    std::string warm_via;   // debug: chain one extra warm hop
     igaos::Options opts;
     bool ok = true;
 };
@@ -73,6 +75,10 @@ Args parse_args(int argc, char** argv) {
             a.opts.presolve = (std::string(argv[++i]) == "on");
         else if (f == "--verbose") ++a.opts.verbosity;
         else if (f == "--out" && i + 1 < argc) a.out_path = argv[++i];
+        else if (f == "--warm-from" && i + 1 < argc)
+            a.warm_from = argv[++i];
+        else if (f == "--warm-via" && i + 1 < argc)
+            a.warm_via = argv[++i];
         else if (f == "--engine" && i + 1 < argc) {
             a.engine = argv[++i];
             if (a.engine != "auto" && a.engine != "simplex" &&
@@ -205,6 +211,22 @@ int main(int argc, char** argv) {
     if (a.cmd == "info") return cmd_info(mdl);
 
     igaos::Solution sol = igaos::solve_with_engine(mdl, a.opts, a.engine);
+    if (!a.warm_from.empty() && a.engine != "milp") {
+        // debug path: warm-start this solve from a reference model's basis;
+        // --warm-via chains one extra warm hop to test snapshot hygiene
+        igaos::io::Model ref;
+        igaos::io::parse_mps(a.warm_from, ref);
+        igaos::simplex::WarmStart ws;
+        igaos::simplex::solve(ref, a.opts, nullptr, &ws);
+        if (!a.warm_via.empty()) {
+            igaos::io::Model via;
+            igaos::io::parse_mps(a.warm_via, via);
+            igaos::simplex::WarmStart ws2;
+            igaos::simplex::solve(via, a.opts, &ws, &ws2);
+            ws = ws2;
+        }
+        sol = igaos::simplex::solve(mdl, a.opts, &ws, nullptr);
+    }
     emit_json(mdl, sol, a.model_path, a.engine, a.out_path);
     return 0;
 }
