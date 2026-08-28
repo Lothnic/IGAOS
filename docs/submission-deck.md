@@ -50,7 +50,11 @@ pybind11 surface.
   sovereign core — every engine implemented from mathematical
   foundations: primal+dual revised simplex, product-form eta updates,
   Gomory MI cuts, OSQP-style ADMM QP.
-- Honest crossover: GPU wins above ~1M-nnz; small LPs stay CPU.
+- **Measured crossover** (docs/research/gpu_showcase.md): at 1.16M nnz
+  PDHG solves ex10 in 4.1s vs HiGHS 1-thread 76.2s (**18.6×**); datt256
+  (1.5M nnz) 32.4s vs HiGHS killed at 2,433s (**>75×**). Below 1M nnz
+  (ken-18) HiGHS wins — reported with equal prominence. Measured, not
+  claimed.
 
 ## Slide 7 — Benchmark honesty
 
