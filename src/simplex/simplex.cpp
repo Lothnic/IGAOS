@@ -176,18 +176,24 @@ Solution solve(const io::Model& model, const Options& opt,
     vector<double> z((size_t)work.n + work.m, 0.0);
 
     // Warm-start restore: reuse a parent solve's basis/states for a model
-    // with the same matrix (B&B child, bounds-only difference). Basics
-    // violating the child bounds are snapped to the violated bound and
-    // their slots become artificials — the existing elastic phase 1 then
-    // restores feasibility from a nearly-good basis.
+    // with the same matrix (B&B child, bounds-only difference). Two paths:
+    //  - dual_warm: snapshot basis is complete (no arts) — the parent
+    //    optimum is dual-feasible, so the DUAL simplex repairs the child's
+    //    primal bound violations directly (no phase 1, no art machinery).
+    //  - otherwise: snap out-of-bound basics to bounds, empty slots become
+    //    artificials, elastic phase 1 restores feasibility.
     bool warm_ok = warm != nullptr &&
                    (int)warm->basis.size() == work.m &&
                    (int)warm->nb_state.size() == work.n + work.m;
+    bool dual_warm = false;
     if (warm_ok) {
         for (int i = 0; i < work.m; ++i) {
             long v = warm->basis[i];
             basis[i] = (v >= 0 && v < (long)(work.n + work.m)) ? (int)v : -1;
         }
+        bool complete = true;
+        for (int i = 0; i < work.m; ++i)
+            if (basis[i] < 0) complete = false;
         // nonbasic states from snapshot; z recomputed from bounds so the
         // child's tighter bounds are honored
         for (long j = 0; j < (long)(work.n + work.m); ++j) {
@@ -218,6 +224,8 @@ Solution solve(const io::Model& model, const Options& opt,
         }
         if (!wlu.ok) {
             warm_ok = false;  // singular restored basis — fall back cold
+        } else if (complete) {
+            dual_warm = true;  // dual simplex takes it from here
         } else {
             vector<double> wzb(work.m, 0.0);
             {
@@ -336,6 +344,7 @@ Solution solve(const io::Model& model, const Options& opt,
     std::mt19937 rng(opt.seed ? (unsigned)opt.seed : 20260825u);
     long iter = 0;
     int degen_streak = 0;
+    double expand_tol = 0.0;  // EXPAND ratio-test tolerance (degenerate runs)
     bool bland = false;
     bool perturbed = false;
     // Columns blocked this basis: their only ratio-test blockers sit below
@@ -350,6 +359,7 @@ Solution solve(const io::Model& model, const Options& opt,
     auto run_simplex = [&](bool phase1) -> int {
         std::fill(skip_col.begin(), skip_col.end(), 0);
         accept_unsafe = false;
+        expand_tol = 0.0;
         basis_dirty = true;  // force a factorization at phase entry
         auto verify_pivot_invariant = [&](const char* tag, int enter,
                                           int lpos, long lvar, double th,
@@ -599,7 +609,11 @@ Solution solve(const io::Model& model, const Options& opt,
             double leave_bound = 0.0;
             bool leave_to_upper = false;
             const double ALPHA_FLOOR = 1e-9;
-            const double DELTA = 1e-8;
+            const double DELTA_BASE = 1e-8;
+            // EXPAND anti-degeneracy: expand_tol (updated post-pivot) grows
+            // each degenerate iteration so zero-distance blockers become
+            // eligible pivots one by one — the basis sequence cannot repeat
+            const double DELTA = DELTA_BASE + expand_tol;
             const double STABILITY = 1e-7 * amax;
             if (amax > ALPHA_FLOOR) {
                 for (int i = 0; i < E.m; ++i) {
@@ -838,8 +852,11 @@ Solution solve(const io::Model& model, const Options& opt,
             if (theta > 1e-9) {
                 degen_streak = 0;
                 bland = false;
+                expand_tol = 0.0;
             } else {
                 ++degen_streak;
+                expand_tol = std::min(expand_tol + DELTA_BASE,
+                                      1e-4 * (1.0 + E.cmax_x));
                 if (degen_streak >= 20 && !bland) {
                     bland = true;
                     degen_streak = 0;
@@ -940,8 +957,155 @@ Solution solve(const io::Model& model, const Options& opt,
         refresh_values();
     };
 
-    int rc1 = run_simplex(true);
-    if (rc1 != 0) {
+    // Bounded-variable dual simplex (from mathematical foundations):
+    // start from a dual-feasible basis (parent optimum), repair primal
+    // bound violations. Leaving row = largest scaled violation; entering
+    // column = dual ratio-test winner among eligible nonbasics. Dual
+    // unboundedness (no eligible column) certifies primal infeasibility.
+    auto run_dual_simplex = [&]() -> int {
+        std::fill(skip_col.begin(), skip_col.end(), 0);
+        accept_unsafe = false;
+        expand_tol = 0.0;
+        basis_dirty = true;
+        vector<double> rho(E.m), cb(E.m), y, unit(E.m, 0.0),
+            ae(E.m), acol(E.m);
+        for (; iter <= opt.max_iterations; ++iter) {
+            if (elapsed() > opt.time_limit_s) {
+                sol.status = Status::TimeLimit;
+                sol.message = "dual simplex: wall-clock budget exhausted";
+                return 3;
+            }
+            for (long j = 0; j < E.total; ++j) {
+                if (st[j] == BASIC) continue;
+                if (st[j] == AT_LOWER && std::isfinite(E.lo[j]))
+                    z[j] = E.lo[j];
+                else if (st[j] == AT_UPPER && std::isfinite(E.up[j]))
+                    z[j] = E.up[j];
+            }
+            if (basis_dirty || lu.needs_refactor()) {
+                if (!build_and_factor()) {
+                    sol.status = Status::Error;
+                    sol.message = "dual simplex: basis factorization failed";
+                    return 2;
+                }
+            }
+            refresh_values();
+
+            // leaving row: largest scaled bound violation
+            int r = -1;
+            double best_v = 1e-9;  // violation ladder floor
+            for (int i = 0; i < E.m; ++i) {
+                long v = basis[i];
+                double viol = std::max(E.lo[v] - zb[i], zb[i] - E.up[v]);
+                if (viol <= 0.0) continue;
+                double bmag = 1.0 + std::max(
+                    std::isfinite(E.lo[v]) ? std::fabs(E.lo[v]) : 0.0,
+                    std::isfinite(E.up[v]) ? std::fabs(E.up[v]) : 0.0);
+                double sv = viol / bmag;
+                if (sv > best_v) { best_v = sv; r = i; }
+            }
+            if (r < 0) return 0;  // primal feasible + dual feasible
+
+            // dual ratio test on row r
+            std::fill(unit.begin(), unit.end(), 0.0);
+            unit[r] = 1.0;
+            lu.solve_transpose(unit, rho);
+            for (int i = 0; i < E.m; ++i) cb[i] = E.cost[basis[i]];
+            lu.solve_transpose(cb, y);
+
+            bool below = zb[r] < E.lo[basis[r]];
+            int enter = -1;
+            double best_ratio = INF, best_arj = 0.0;
+            for (long j = 0; j < E.total; ++j) {
+                if (st[j] == BASIC) continue;
+                if (skip_col[j]) continue;
+                if (std::isfinite(E.lo[j]) && std::isfinite(E.up[j]) &&
+                    E.up[j] - E.lo[j] <= 1e-12)
+                    continue;
+                // alpha_rj = rho . A_j
+                double arj = 0.0;
+                switch (E.kind[j]) {
+                    case KIND_X:
+                        for (int p = E.cp[j]; p < E.cp[j + 1]; ++p)
+                            arj += rho[E.ci[p]] * E.cv[p];
+                        break;
+                    case KIND_SLACK:
+                        arj = -rho[j - E.nx];
+                        break;
+                    case KIND_ART:
+                        arj = rho[E.art_row[j - E.nx - E.m]] *
+                              E.art_sigma[j - E.nx - E.m];
+                        break;
+                }
+                if (std::fabs(arj) <= 1e-9) continue;
+                // eligibility: d zb_r = -arj * t_j must be positive (below)
+                // resp. negative (above); t_j > 0 from AT_LOWER, < 0 from
+                // AT_UPPER, either for FREE_NB
+                bool elig;
+                if (st[j] == FREE_NB) {
+                    elig = true;
+                } else if (below) {
+                    elig = (st[j] == AT_LOWER) ? (arj < 0) : (arj > 0);
+                } else {
+                    elig = (st[j] == AT_LOWER) ? (arj > 0) : (arj < 0);
+                }
+                if (!elig) continue;
+                double dj = E.reduced_cost_part((int)j, y);
+                double ratio = std::fabs(dj) / std::fabs(arj);
+                // stability: among near-ties prefer the larger |arj|
+                if (ratio < best_ratio * (1.0 - 1e-9) ||
+                    (ratio < best_ratio * (1.0 + 1e-9) &&
+                     std::fabs(arj) > std::fabs(best_arj))) {
+                    best_ratio = ratio;
+                    best_arj = arj;
+                    enter = (int)j;
+                }
+            }
+            if (enter < 0) {
+                // dual unbounded: no column can repair row r
+                sol.status = Status::Infeasible;
+                sol.message =
+                    "infeasible: dual simplex found no repair column for "
+                    "violated row";
+                return 1;
+            }
+
+            // pivot: entering takes slot r; leaving exits to its violated
+            // bound
+            int leaving = basis[r];
+            z[leaving] = below ? E.lo[leaving] : E.up[leaving];
+            st[leaving] = below ? AT_LOWER : AT_UPPER;
+            basis[r] = enter;
+            st[enter] = BASIC;
+            // eta: full column B^{-1} a_enter
+            E.col_dense(enter, ae);
+            lu.solve(ae, acol);
+            lu.update(r, acol);
+        }
+        sol.status = Status::IterationLimit;
+        sol.message = "dual simplex: iteration cap reached";
+        return 4;
+    };
+
+    bool dual_done = false;
+    if (dual_warm) {
+        for (int j = 0; j < E.nx; ++j) E.cost[j] = E.xs_cost[j];
+        int rcd = run_dual_simplex();
+        if (rcd == 0) {
+            dual_done = true;
+        } else {
+            // dual failed (time/error/iteration): honest error — the B&B
+            // caller cold-solves on Error
+            sol.iterations = iter;
+            sol.solve_time_ms = elapsed() * 1000.0;
+            if (rcd != 1) return sol;  // infeasible already carries status
+            return sol;
+        }
+    }
+
+    int rc1 = -1;
+    if (!dual_done) rc1 = run_simplex(true);
+    if (!dual_done && rc1 != 0) {
         sol.iterations = iter;
         sol.solve_time_ms = elapsed() * 1000.0;
         return sol;
