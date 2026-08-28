@@ -36,7 +36,7 @@ pybind11 surface.
 
 | Evidence | Result | Artifact |
 |---|---|---|
-| Netlib LP ladder (64 inst ≤700 rows) | **60/64 exact vs HiGHS** (94%) | `docs/research/sweep_results.csv`, `demo/regress_netlib.py` |
+| Netlib LP ladder (64 inst ≤700 rows) | **63/64 exact vs HiGHS** (98%) | `docs/research/sweep_results.csv`, `demo/regress_netlib.py` |
 | False-unbounded bug class | fixed (pilot4 exact; perold honest error) | commit `4c49d09` |
 | Infeasibility detection | klein1 + refinery **proven** infeasible | `docs/research/robustness_results.csv` |
 | MPS edge cases | RANGES/FR/objective-constant correct (e226 exact) | `src/io/model.hpp` |
