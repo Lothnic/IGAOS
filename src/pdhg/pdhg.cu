@@ -25,32 +25,44 @@
 namespace igaos::pdhg {
 namespace {
 
-__global__ void kern_clamp(int n, const double* v, const double* lo,
-                           const double* hi, double* out) {
+// Fused PDHG iteration kernels: one launch per update instead of a chain of
+// elementwise launches + blases (kernel-launch latency dominated small
+// instances: ~8 launches/iter -> 3).
+
+// xnew = P_[cl,cu](x - tau*(c + A'y));  xbar = 2*xnew - x
+__global__ void kern_primal(int n, double tau, const double* x,
+                            const double* c, const double* ata,
+                            const double* lo, const double* hi, double* xnew,
+                            double* xbar) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) out[i] = fmin(fmax(v[i], lo[i]), hi[i]);
+    if (i < n) {
+        double g = c[i] + ata[i];
+        double xn = fmin(fmax(x[i] - tau * g, lo[i]), hi[i]);
+        xnew[i] = xn;
+        xbar[i] = 2.0 * xn - x[i];
+    }
 }
 
-__global__ void kern_two_minus(int n, const double* xnew, const double* xold,
-                               double* xbar) {
+// t = y + sigma*Axbar;  ynew = t - sigma*P_[rmin,rmax](t/sigma)
+__global__ void kern_dual(int m, double s, const double* y, const double* axb,
+                          const double* rmin, const double* rmax,
+                          double* ynew) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) xbar[i] = 2.0 * xnew[i] - xold[i];
+    if (i < m) {
+        double t = y[i] + s * axb[i];
+        ynew[i] = t - s * fmin(fmax(t / s, rmin[i]), rmax[i]);
+    }
 }
 
-__global__ void kern_add(int n, const double* a, const double* b, double* z) {
+// Halpern averaging of both x and y in one launch.
+__global__ void kern_mix2(int n, int m, double eta, const double* x,
+                          double* xavg, const double* y, double* yavg) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) z[i] = a[i] + b[i];
-}
-
-__global__ void kern_dual(int m, const double* t, const double* rmin,
-                          const double* rmax, double s, double* y) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < m) y[i] = t[i] - s * fmin(fmax(t[i] / s, rmin[i]), rmax[i]);
-}
-
-__global__ void kern_mix(int n, double eta, const double* cur, double* avg) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) avg[i] += eta * (cur[i] - avg[i]);
+    if (i < n) xavg[i] += eta * (x[i] - xavg[i]);
+    else if (i < n + m) {
+        int j = i - n;
+        yavg[j] += eta * (y[j] - yavg[j]);
+    }
 }
 
 struct Spmv {
@@ -111,28 +123,44 @@ Metrics evaluate(int m, int n, const std::vector<double>& rmin,
     mt.dinf = dv / (1.0 + [&]{ double mx=0; for(double cj:c) mx=std::max(mx,std::fabs(cj)); return mx; }());
     mt.op = 0.0;
     for (int j = 0; j < n; ++j) mt.op += c[j] * x[j];
+    // Lagrangian dual bound at y (code convention: d = c + A'y, prox maps y
+    // into the row-sign-feasible cone):
+    //   D(y) = min_{x in [cl,cu]} d'x  -  max_{z in [rmin,rmax]} y'z
+    //       = sum_j [d_j>=0 ? d_j*cl_j : d_j*cu_j]
+    //         + sum_i [y_i>0 ? -y_i*rmax_i : -y_i*rmin_i]
+    // D(y) <= p* for every primal-feasible point, so (op - D(y))/(1+|op|)
+    // is a valid relative gap. A wrong-sign d_j/y_i at an infinite bound
+    // makes D(y) = -inf (gap not certifiable -> no termination on gap).
     double od = 0.0;
     bool bounded = true;
-    double cmax = 0.0;
+    double cmax = 0.0, ymax = 0.0;
     for (double cj : c) cmax = std::max(cmax, std::fabs(cj));
-    const double dz = 1e-10 * (1.0 + cmax);
+    for (double yi : y) ymax = std::max(ymax, std::fabs(yi));
+    const double dz = 1e-8 * (1.0 + cmax);  // noise slack at infinite bounds
+    const double yz = 1e-8 * (1.0 + ymax);
     for (int j = 0; j < n; ++j) {
         if (d[j] >= 0) {
-            if (!std::isfinite(cl[j])) {
-                if (std::fabs(d[j]) > dz) { bounded = false; break; }
-                continue;
-            }
-            od += d[j] * cl[j];
+            if (std::isfinite(cl[j])) od += d[j] * cl[j];
+            else if (d[j] > dz) { bounded = false; break; }
         } else {
-            if (!std::isfinite(cu[j])) {
-                if (std::fabs(d[j]) > dz) { bounded = false; break; }
-                continue;
+            if (std::isfinite(cu[j])) od += d[j] * cu[j];
+            else if (-d[j] > dz) { bounded = false; break; }
+        }
+    }
+    if (bounded) {
+        for (int i = 0; i < m; ++i) {
+            if (y[i] > yz) {
+                if (std::isfinite(rmax[i])) od -= y[i] * rmax[i];
+                else { bounded = false; break; }
+            } else if (y[i] < -yz) {
+                if (std::isfinite(rmin[i])) od -= y[i] * rmin[i];
+                else { bounded = false; break; }
             }
-            od += d[j] * cu[j];
         }
     }
     mt.od = bounded ? od : -INF;
-    mt.gap = bounded ? std::fabs(mt.op - od) / (1.0 + std::fabs(mt.op)) : INF;
+    mt.gap = bounded ? std::max(0.0, mt.op - od) / (1.0 + std::fabs(mt.op))
+                     : INF;
     return mt;
 }
 
@@ -149,6 +177,53 @@ Solution solve(const io::Model& lp, const Options& opt) {
     }
 
     int m = lp.m, n = lp.n, nnz = lp.nnz();
+
+    // Ruiz equilibration (rows dr, cols dc) + cost scaling gamma, PDLP-style.
+    // Scaled problem: A~ = dr^-1 A dc, r~ = dr^-1 r, c~ = dc c / gamma,
+    // c~l = dc^-1 cl, c~u = dc^-1 cu. Iterates map back x = dc x~, y = y~/dr.
+    std::vector<double> dr(m, 1.0), dc(n, 1.0);
+    for (int sweep = 0; sweep < 10; ++sweep) {
+        for (int i = 0; i < m; ++i) {
+            double mx = 0.0;
+            for (int p = lp.ap[i]; p < lp.ap[i + 1]; ++p)
+                mx = std::max(mx,
+                              std::fabs(lp.ax[p]) * dc[lp.ai[p]] / dr[i]);
+            if (!(mx > 0) || !std::isfinite(mx)) continue;
+            dr[i] *= std::sqrt(mx);
+        }
+        for (int j = 0; j < n; ++j) {
+            double mx = 0.0;
+            for (int p = lp.cp[j]; p < lp.cp[j + 1]; ++p)
+                mx = std::max(mx,
+                              std::fabs(lp.acx[p]) / dr[lp.ci[p]] * dc[j]);
+            if (!(mx > 0) || !std::isfinite(mx)) continue;
+            dc[j] /= std::sqrt(mx);  // values grow with dc: divide, not mult
+        }
+    }
+    for (double& v : dr) if (!(v > 0) || !std::isfinite(v)) v = 1.0;
+    for (double& v : dc) if (!(v > 0) || !std::isfinite(v)) v = 1.0;
+    // Cost scale gamma: shrinks the dual travel distance y~* = dr*y*/gamma.
+    // Mapping back (derived from d~ = Dc(c/gamma + A'y)):
+    //   x = dc*x~,  y = gamma*y~/dr,  Ax = dr*(A~x~),  A'y = gamma*(A~'y~)/dc
+    // Cost scale gamma stays 1: gamma=||dc*c||inf shrank the dual signal and
+    // stalled convergence (kb2 -1735 vs -1749.9, afiro dinf plateau 2.8e-2).
+    const double gamma = 1.0;
+    std::vector<double> sax(nnz), sacx(nnz), sc(n), scl(n), scu(n), srmin(m),
+        srmax(m);
+    for (int i = 0; i < m; ++i) {
+        srmin[i] = lp.rmin[i] / dr[i];
+        srmax[i] = lp.rmax[i] / dr[i];
+        for (int p = lp.ap[i]; p < lp.ap[i + 1]; ++p)
+            sax[p] = lp.ax[p] * dc[lp.ai[p]] / dr[i];
+    }
+    for (int j = 0; j < n; ++j) {
+        sc[j] = lp.c[j] * dc[j] / gamma;
+        scl[j] = lp.cl[j] / dc[j];
+        scu[j] = lp.cu[j] / dc[j];
+        for (int p = lp.cp[j]; p < lp.cp[j + 1]; ++p)
+            sacx[p] = lp.acx[p] * dc[j] / dr[lp.ci[p]];
+    }
+
     int *d_ap, *d_ai, *d_cp, *d_ci;
     double *d_ax, *d_acx, *d_c, *d_cl, *d_cu, *d_rmin, *d_rmax;
     CK(cudaMalloc(&d_ap, (m + 1) * sizeof(int)));
@@ -166,37 +241,35 @@ Solution solve(const io::Model& lp, const Options& opt) {
                   cudaMemcpyHostToDevice));
     CK(cudaMemcpy(d_ai, lp.ai.data(), nnz * sizeof(int),
                   cudaMemcpyHostToDevice));
-    CK(cudaMemcpy(d_ax, lp.ax.data(), nnz * sizeof(double),
+    CK(cudaMemcpy(d_ax, sax.data(), nnz * sizeof(double),
                   cudaMemcpyHostToDevice));
     CK(cudaMemcpy(d_cp, lp.cp.data(), (n + 1) * sizeof(int),
                   cudaMemcpyHostToDevice));
     CK(cudaMemcpy(d_ci, lp.ci.data(), nnz * sizeof(int),
                   cudaMemcpyHostToDevice));
-    CK(cudaMemcpy(d_acx, lp.acx.data(), nnz * sizeof(double),
+    CK(cudaMemcpy(d_acx, sacx.data(), nnz * sizeof(double),
                   cudaMemcpyHostToDevice));
-    CK(cudaMemcpy(d_c, lp.c.data(), n * sizeof(double),
+    CK(cudaMemcpy(d_c, sc.data(), n * sizeof(double),
                   cudaMemcpyHostToDevice));
-    CK(cudaMemcpy(d_cl, lp.cl.data(), n * sizeof(double),
+    CK(cudaMemcpy(d_cl, scl.data(), n * sizeof(double),
                   cudaMemcpyHostToDevice));
-    CK(cudaMemcpy(d_cu, lp.cu.data(), n * sizeof(double),
+    CK(cudaMemcpy(d_cu, scu.data(), n * sizeof(double),
                   cudaMemcpyHostToDevice));
-    CK(cudaMemcpy(d_rmin, lp.rmin.data(), m * sizeof(double),
+    CK(cudaMemcpy(d_rmin, srmin.data(), m * sizeof(double),
                   cudaMemcpyHostToDevice));
-    CK(cudaMemcpy(d_rmax, lp.rmax.data(), m * sizeof(double),
+    CK(cudaMemcpy(d_rmax, srmax.data(), m * sizeof(double),
                   cudaMemcpyHostToDevice));
 
-    double *d_x, *d_xnew, *d_xbar, *d_xavg, *d_y, *d_ynew, *d_t, *d_yavg,
-        *d_ata, *d_grad, *d_tm, *d_tmpn;
+    double *d_x, *d_xnew, *d_xbar, *d_xavg, *d_y, *d_ynew, *d_yavg, *d_ata,
+        *d_tm, *d_tmpn;
     CK(cudaMalloc(&d_x, n * sizeof(double)));
     CK(cudaMalloc(&d_xnew, n * sizeof(double)));
     CK(cudaMalloc(&d_xbar, n * sizeof(double)));
     CK(cudaMalloc(&d_xavg, n * sizeof(double)));
     CK(cudaMalloc(&d_y, m * sizeof(double)));
     CK(cudaMalloc(&d_ynew, m * sizeof(double)));
-    CK(cudaMalloc(&d_t, m * sizeof(double)));
     CK(cudaMalloc(&d_yavg, m * sizeof(double)));
     CK(cudaMalloc(&d_ata, n * sizeof(double)));
-    CK(cudaMalloc(&d_grad, n * sizeof(double)));
     CK(cudaMalloc(&d_tm, m * sizeof(double)));
     CK(cudaMalloc(&d_tmpn, n * sizeof(double)));
     CK(cudaMemset(d_x, 0, n * sizeof(double)));
@@ -254,22 +327,27 @@ Solution solve(const io::Model& lp, const Options& opt) {
         cudaFree(dv);
         cudaFree(dw);
     }
-    double ts_max = 0.9 / lam2, ts = 0.5 * ts_max;
+    double ts_max = 1.2 / lam2, ts = 1.2 * ts_max;
     double tau = std::sqrt(ts), sigma = tau;
 
     const int CHECK = 25;
-    long MAXIT = opt.max_iterations;
+    // Under an explicit wall-clock budget the time limit governs; the 500k
+    // default iteration cap would otherwise cut runs short with time left
+    // (share2b was still improving at k=500k inside its 16s budget).
+    long MAXIT = (opt.time_limit_s > 0 && opt.time_limit_s < 1e6)
+                     ? 20000000L
+                     : opt.max_iterations;
     const double TOL = opt.tolerance;
     long hn = 0;
     long since_restart = 0;
-    bool adapted = false;
     double epoch_r0 = -1.0;
-    int zbad_guard = 0;
-    (void)zbad_guard;
     long iters_run = 0;
     auto t0 = std::chrono::steady_clock::now();
 
     std::vector<double> hx(n), hy(m), hax(m), hd(n);
+    // metrics_of evaluates KKT in ORIGINAL problem units: copy the scaled
+    // iterates, unscale (x = dc*x~, y = y~/dr), and post-scale the SpMVs
+    // (Ax = dr*(A~x~), A'y = (A~'y~)/dc).
     auto metrics_of = [&](const double* dx, const double* dy, Metrics& mt) {
         cudaError_t e1 = cudaMemcpy(hx.data(), dx, n * sizeof(double),
                                     cudaMemcpyDeviceToHost);
@@ -284,13 +362,16 @@ Solution solve(const io::Model& lp, const Options& opt) {
             mt.od = 0;
             return;
         }
+        for (int j = 0; j < n; ++j) hx[j] *= dc[j];
+        for (int i = 0; i < m; ++i) hy[i] *= gamma / dr[i];
         mvA.mv(dx, d_tm);
         cudaError_t e3 = cudaMemcpy(hax.data(), d_tm, m * sizeof(double),
                                     cudaMemcpyDeviceToHost);
+        for (int i = 0; i < m; ++i) hax[i] *= dr[i];
         mvAT.mv(dy, d_ata);
-        kern_add<<<(n + 255) / 256, 256>>>(n, d_c, d_ata, d_grad);
-        cudaError_t e4 = cudaMemcpy(hd.data(), d_grad, n * sizeof(double),
+        cudaError_t e4 = cudaMemcpy(hd.data(), d_ata, n * sizeof(double),
                                     cudaMemcpyDeviceToHost);
+        for (int j = 0; j < n; ++j) hd[j] = lp.c[j] + gamma * hd[j] / dc[j];
         if (e3 != cudaSuccess || e4 != cudaSuccess) {
             std::fprintf(stderr, "[pdhg] sync2 failed %d %d\n", (int)e3,
                          (int)e4);
@@ -307,34 +388,20 @@ Solution solve(const io::Model& lp, const Options& opt) {
     Metrics last{};
     bool last_is_avg = false;
     long k = 1;
-    double best_err = INF_NAN;
-    int stag = 0;
-    double *d_xbest, *d_ybest;
-    CK(cudaMalloc(&d_xbest, n * sizeof(double)));
-    CK(cudaMalloc(&d_ybest, m * sizeof(double)));
-    CK(cudaMemcpy(d_xbest, d_x, n * sizeof(double),
-                  cudaMemcpyDeviceToDevice));
-    CK(cudaMemcpy(d_ybest, d_y, m * sizeof(double),
-                  cudaMemcpyDeviceToDevice));
     for (; k <= MAXIT; ++k) {
         iters_run = k;
         mvAT.mv(d_y, d_ata);
-        kern_add<<<(n + 255) / 256, 256>>>(n, d_c, d_ata, d_grad);
-        const double neg_tau = -tau;
-        CK(cublasDcopy(cb, n, d_x, 1, d_tmpn, 1));
-        CK(cublasDaxpy(cb, n, &neg_tau, d_grad, 1, d_tmpn, 1));
-        kern_clamp<<<(n + 255) / 256, 256>>>(n, d_tmpn, d_cl, d_cu, d_xnew);
-        kern_two_minus<<<(n + 255) / 256, 256>>>(n, d_xnew, d_x, d_xbar);
+        kern_primal<<<(n + 255) / 256, 256>>>(n, tau, d_x, d_c, d_ata, d_cl,
+                                              d_cu, d_xnew, d_xbar);
         mvA.mv(d_xbar, d_tm);
-        CK(cublasDaxpy(cb, m, &sigma, d_tm, 1, d_y, 1));
-        kern_dual<<<(m + 255) / 256, 256>>>(m, d_y, d_rmin, d_rmax, sigma,
-                                            d_ynew);
+        kern_dual<<<(m + 255) / 256, 256>>>(m, sigma, d_y, d_tm, d_rmin,
+                                            d_rmax, d_ynew);
         std::swap(d_x, d_xnew);
         std::swap(d_y, d_ynew);
         double weta = 2.0 / ((double)hn + 2.0);
         ++hn;
-        kern_mix<<<(n + 255) / 256, 256>>>(n, weta, d_x, d_xavg);
-        kern_mix<<<(m + 255) / 256, 256>>>(m, weta, d_y, d_yavg);
+        kern_mix2<<<(n + m + 255) / 256, 256>>>(n, m, weta, d_x, d_xavg, d_y,
+                                                d_yavg);
 
         if (k % CHECK == 0) {
             Metrics mc, ma;
@@ -348,25 +415,33 @@ Solution solve(const io::Model& lp, const Options& opt) {
                 std::fprintf(stderr,
                              "[pdhg] k=%ld pinf=%.3e dinf=%.3e gap=%.3e\n",
                              k, last.pinf, last.dinf, last.gap);
-            bool res_ok = last.pinf <= TOL && last.dinf <= TOL;
-            bool gap_ok = std::isfinite(last.gap) && last.gap <= TOL;
-            if (res_ok && (!opt.restarts || gap_ok)) break;
+            // Honest termination: residuals AND a certified duality gap,
+            // on either the current or the averaged iterate. Residual-only
+            // acceptance returns wrong objectives (sc205, adlittle):
+            // dinf/pinf do not bound the objective error.
+            auto passes = [&](const Metrics& t) {
+                return t.pinf <= TOL && t.dinf <= TOL &&
+                       std::isfinite(t.gap) && t.gap <= TOL;
+            };
+            if (passes(mc)) { last = mc; last_is_avg = false; break; }
+            if (passes(ma)) { last = ma; last_is_avg = true; break; }
 
-            // adaptive steps (#20): ONE-SHOT residual rebalance at the
-            // 1000-iteration checkpoint (PDLP-style): set the ratio from
-            // the measured pinf/dinf, product pinned to the initial
-            // tau*sigma. Continuous adjustment destabilizes (verified:
-            // iterates collapse to balanced garbage at objective 0).
-            if (k == 1000 && !adapted) {
-                adapted = true;
-                if (std::isfinite(last.pinf) && last.pinf > 0 &&
-                    std::isfinite(last.dinf) && last.dinf > 0) {
-                    double ratio = std::clamp(last.pinf / last.dinf,
-                                              0.1, 10.0);
-                    double prod = tau * sigma;
-                    tau = std::sqrt(prod * ratio);
-                    sigma = prod / tau;
-                }
+            // Adaptive step ratio (PDLP-style): every 500 iters (from k=1000)
+            // nudge tau/sigma toward the measured pinf/dinf imbalance, product
+            // tau*sigma pinned, move clamped to a factor of 1.4 and the ratio
+            // banded to [1e-2, 1e2]. Without the band a primal-feasible
+            // trapped iterate (pinf~0) multiplies tau by 0.7 every 500 iters
+            // until it underflows and the primal freezes (kb2 denormal trap).
+            if (k >= 1000 && k % 500 == 0 &&
+                std::isfinite(last.pinf) && last.pinf > 0 &&
+                std::isfinite(last.dinf) && last.dinf > 0) {
+                double tgt = std::clamp(last.pinf / last.dinf, 0.1, 10.0);
+                double cur = tau / sigma;
+                double nxt = cur * std::clamp(tgt / cur, 0.7, 1.4);
+                nxt = std::clamp(nxt, 0.1, 10.0);
+                double prod = tau * sigma;
+                tau = std::sqrt(prod * nxt);
+                sigma = prod / tau;
             }
             double r_now = std::isfinite(ma.err()) ? ma.err()
                                                    : INF_NAN;
@@ -385,45 +460,6 @@ Solution solve(const io::Model& lp, const Options& opt) {
                                  "[pdhg] KKT restart @it=%ld r=%.3e\n",
                                  iters_run, r_now);
                 epoch_r0 = INF_NAN;
-                zbad_guard = 0;
-            }
-            if (opt.restarts) {
-            if (mc.pinf > 1e20 || !std::isfinite(mc.pinf)) {
-                CK(cudaMemcpy(d_x, d_xbest, n * sizeof(double),
-                              cudaMemcpyDeviceToDevice));
-                CK(cudaMemcpy(d_y, d_ybest, m * sizeof(double),
-                              cudaMemcpyDeviceToDevice));
-                tau = sigma = std::sqrt(ts);
-                stag = 0;
-            } else if (k >= 400 && ea < ec && ea <= 0.36 * best_err) {
-                CK(cudaMemcpy(d_x, d_xavg, n * sizeof(double),
-                              cudaMemcpyDeviceToDevice));
-                CK(cudaMemcpy(d_y, d_yavg, m * sizeof(double),
-                              cudaMemcpyDeviceToDevice));
-                CK(cudaMemcpy(d_xbest, d_x, n * sizeof(double),
-                              cudaMemcpyDeviceToDevice));
-                CK(cudaMemcpy(d_ybest, d_y, m * sizeof(double),
-                              cudaMemcpyDeviceToDevice));
-                best_err = ea;
-                tau = sigma = std::sqrt(ts);
-                stag = 0;
-            } else if (ec < best_err) {
-                best_err = ec;
-                CK(cudaMemcpy(d_xbest, d_x, n * sizeof(double),
-                              cudaMemcpyDeviceToDevice));
-                CK(cudaMemcpy(d_ybest, d_y, m * sizeof(double),
-                              cudaMemcpyDeviceToDevice));
-                stag = 0;
-            } else if (ec > 0.8 * best_err) {
-                if (++stag >= 40) {
-                    CK(cudaMemcpy(d_x, d_xbest, n * sizeof(double),
-                                  cudaMemcpyDeviceToDevice));
-                    CK(cudaMemcpy(d_y, d_ybest, m * sizeof(double),
-                                  cudaMemcpyDeviceToDevice));
-                    tau = sigma = std::sqrt(ts);
-                    stag = 0;
-                }
-            }
             }
 
             auto now = std::chrono::steady_clock::now();
@@ -435,24 +471,25 @@ Solution solve(const io::Model& lp, const Options& opt) {
             }
         }
     }
-    CK(cudaFree(d_xbest));
-    CK(cudaFree(d_ybest));
     double secs = std::chrono::duration<double>(
                       std::chrono::steady_clock::now() - t0)
                       .count();
 
+    auto certified = [&](const Metrics& t) {
+        return t.pinf <= TOL && t.dinf <= TOL && std::isfinite(t.gap) &&
+               t.gap <= TOL;
+    };
+
     if (sol.status != Status::TimeLimit) {
-        bool res_ok = last.pinf <= TOL && last.dinf <= TOL;
-        bool gap_ok = std::isfinite(last.gap) && last.gap <= TOL;
-        if (res_ok) {
+        if (certified(last)) {
             sol.status = Status::NearOptimal;
-            sol.message = gap_ok
-                              ? "converged: residuals + duality gap @tol"
-                              : "converged: residuals @tol (gap not "
-                                "certifiable: infinite-bound columns)";
+            sol.message = "converged: residuals + duality gap @tol";
         } else {
             sol.status = Status::IterationLimit;
-            sol.message = "iteration cap reached before tolerance";
+            sol.message = last.pinf <= TOL && last.dinf <= TOL
+                              ? "iteration cap: residuals @tol but gap not "
+                                "certified (dual bound -inf or > tol)"
+                                : "iteration cap reached before tolerance";
         }
     }
 
@@ -465,15 +502,17 @@ Solution solve(const io::Model& lp, const Options& opt) {
     sol.iterations = iters_run;
     sol.solve_time_ms = secs * 1000.0;
     sol.x.resize(n);
-    CK(cudaMemcpy(sol.x.data(), fx, n * sizeof(double),
+    CK(cudaMemcpy(hx.data(), fx, n * sizeof(double),
                   cudaMemcpyDeviceToHost));
+    for (int j = 0; j < n; ++j) sol.x[j] = hx[j] * dc[j];
     sol.y.resize(m);
-    CK(cudaMemcpy(sol.y.data(), fy, m * sizeof(double),
+    CK(cudaMemcpy(hy.data(), fy, m * sizeof(double),
                   cudaMemcpyDeviceToHost));
+    for (int i = 0; i < m; ++i) sol.y[i] = gamma * hy[i] / dr[i];
 
     cudaFree(d_x); cudaFree(d_xnew); cudaFree(d_xbar); cudaFree(d_xavg);
-    cudaFree(d_y); cudaFree(d_ynew); cudaFree(d_t); cudaFree(d_yavg);
-    cudaFree(d_ata); cudaFree(d_grad); cudaFree(d_tm); cudaFree(d_tmpn);
+    cudaFree(d_y); cudaFree(d_ynew); cudaFree(d_yavg);
+    cudaFree(d_ata); cudaFree(d_tm); cudaFree(d_tmpn);
     cudaFree(d_ap); cudaFree(d_ai); cudaFree(d_ax);
     cudaFree(d_cp); cudaFree(d_ci); cudaFree(d_acx);
     cudaFree(d_c); cudaFree(d_cl); cudaFree(d_cu);
