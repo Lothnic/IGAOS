@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <climits>
 #include <limits>
+#include <map>
 #include <random>
 #include <vector>
 
@@ -107,7 +108,9 @@ struct Engine {
 }  // namespace
 
 Solution solve(const io::Model& model, const Options& opt,
-               const WarmStart* warm, WarmStart* warm_out) {
+               const WarmStart* warm, WarmStart* warm_out,
+               std::vector<CutRow>* cuts_out,
+               const std::vector<unsigned char>* true_integ) {
     Solution sol;
     auto t0 = std::chrono::steady_clock::now();
     auto elapsed = [&]() {
@@ -1348,6 +1351,116 @@ Solution solve(const io::Model& model, const Options& opt,
                             : "optimal";
     sol.iterations = iter;
     sol.solve_time_ms = elapsed() * 1000.0;
+    const std::vector<unsigned char>& cut_integ =
+        true_integ != nullptr ? *true_integ : model.integ;
+    if (cuts_out != nullptr && sol.status == Status::Optimal) {
+        // Gomory mixed-integer cuts from fractional basic integer
+        // variables. Only PURE-STRUCTURAL tableau rows are emitted (rows
+        // touching slacks/arts are skipped — translating slack
+        // coefficients back to model rows is future work). Scaling is
+        // power-of-two so unscaling is exact.
+        const int MAX_CUTS = 20;
+        vector<double> rho(E.m), unit(E.m);
+        for (int r = 0; r < E.m && (int)cuts_out->size() < MAX_CUTS; ++r) {
+            long k = basis[r];
+            if (k < 0 || k >= E.nx) continue;               // structural
+            if (!cut_integ[k]) continue;                     // integer
+            double beta = zb[r] * E.sc.col[k];              // original value
+            double f0 = beta - std::floor(beta);
+            if (f0 < 0.01 || f0 > 0.99) continue;
+            std::fill(unit.begin(), unit.end(), 0.0);
+            unit[r] = 1.0;
+            lu.solve_transpose(unit, rho);
+            // tableau row over nonbasic structurals and slacks (slack i is
+            // the row activity s_i = A_i x, so its coefficient folds into
+            // structural space); art coefficients disqualify the row
+            bool usable = true;
+            vector<std::pair<int, double>> row_terms;  // (j, a_j^orig)
+            vector<std::pair<int, double>> slack_terms;  // (row i, a^orig)
+            for (long j = 0; j < E.total && usable; ++j) {
+                if (st[j] == BASIC) continue;
+                double aj = 0.0;
+                switch (E.kind[j]) {
+                    case KIND_X:
+                        for (int p = E.cp[j]; p < E.cp[j + 1]; ++p)
+                            aj += rho[E.ci[p]] * E.cv[p];
+                        break;
+                    case KIND_SLACK:
+                        aj = -rho[j - E.nx];
+                        break;
+                    case KIND_ART:
+                        aj = rho[E.art_row[j - E.nx - E.m]] *
+                             E.art_sigma[j - E.nx - E.m];
+                        break;
+                }
+                if (std::fabs(aj) <= 1e-9) continue;
+                if (E.kind[j] == KIND_ART) {
+                    usable = false;  // arts have no model-space meaning
+                    continue;
+                }
+                double sigma = (st[j] == AT_UPPER) ? -1.0 : 1.0;
+                if (j < E.nx) {
+                    // unscale into original space (powers of two: exact)
+                    double a_orig = aj * sigma * E.sc.col[k] / E.sc.col[j];
+                    row_terms.emplace_back((int)j, a_orig);
+                } else {
+                    int i = (int)(j - E.nx);
+                    double a_orig =
+                        aj * sigma * E.sc.col[k] / E.sc.row[i];
+                    slack_terms.emplace_back(i, a_orig);
+                }
+            }
+            if (!usable || (row_terms.empty() && slack_terms.empty()))
+                continue;
+            // GMI coefficients over structurals (integer formula) and
+            // slacks (continuous formula). Cut: sum pi_j u_j >= f0 with
+            // u_j = sigma_j (x_j - x_j^cur) >= 0; slacks substitute
+            // s_i = A_i x into structural space.
+            CutRow cut;
+            double lhs = f0;
+            std::map<int, double> coef;  // column -> accumulated coefficient
+            for (auto& [j, a] : row_terms) {
+                double sigma = (st[j] == AT_UPPER) ? -1.0 : 1.0;
+                double pi;
+                if (cut_integ[j]) {
+                    double fj = a - std::floor(a);
+                    pi = (fj <= f0) ? fj : f0 * (1.0 - fj) / (1.0 - f0);
+                } else {
+                    pi = (a > 0) ? a * f0 / (1.0 - f0)
+                                 : -a * (1.0 - f0) / f0;
+                }
+                if (std::fabs(pi) < 1e-9) continue;
+                coef[j] += pi * sigma;
+                double z_orig = z[j] * E.sc.col[j];
+                lhs += pi * sigma * z_orig;
+            }
+            for (auto& [i, a] : slack_terms) {
+                // slack i is continuous with original value = row activity
+                long sv = E.nx + i;
+                double sigma = (st[sv] == AT_UPPER) ? -1.0 : 1.0;
+                double pi = (a > 0) ? a * f0 / (1.0 - f0)
+                                    : -a * (1.0 - f0) / f0;
+                if (std::fabs(pi) < 1e-9) continue;
+                double act = 0.0;
+                for (int p = work.ap[i]; p < work.ap[i + 1]; ++p) {
+                    int j = work.ai[p];
+                    coef[j] += pi * sigma * work.ax[p];
+                    act += work.ax[p] * sol.x[j];
+                }
+                lhs += pi * sigma * act;
+            }
+            for (auto& [j, c] : coef)
+                if (std::fabs(c) > 1e-9) cut.coeffs.emplace_back(j, c);
+            cut.lhs = lhs;
+            cut.lhs = lhs;
+            // dynamism guard: reject wild cuts
+            double amax = 0.0;
+            for (auto& [j, c] : cut.coeffs)
+                amax = std::max(amax, std::fabs(c));
+            if (amax > 1e6 || cut.coeffs.empty()) continue;
+            cuts_out->push_back(std::move(cut));
+        }
+    }
     if (warm_out != nullptr && sol.status == Status::Optimal) {
         // snapshot: structural+slack basis slots (arts recorded as -1 —
         // restore treats them as empty slots) and nonbasic states

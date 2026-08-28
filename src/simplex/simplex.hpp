@@ -14,8 +14,17 @@ struct WarmStart {
     std::vector<unsigned char> nb_state;    // size n+m: nonbasic states
 };
 
+// Gomory mixed-integer cut over original model columns: cut rows are
+// sum coeffs_j x_j >= lhs.
+struct CutRow {
+    std::vector<std::pair<int, double>> coeffs;  // (column, coefficient)
+    double lhs;
+};
+
 Solution solve(const io::Model& model, const Options& options,
                const WarmStart* warm = nullptr,
-               WarmStart* warm_out = nullptr);
+               WarmStart* warm_out = nullptr,
+               std::vector<CutRow>* cuts_out = nullptr,
+               const std::vector<unsigned char>* true_integ = nullptr);
 
 }  // namespace igaos::simplex

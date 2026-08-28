@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <set>
+#include <tuple>
 #include <vector>
 
 namespace igaos::milp {
@@ -79,6 +80,80 @@ Solution solve(const io::Model& model, const Options& opt) {
     const double INT_TOL = 1e-6;
     const double GAP_TOL = 1e-9;  // bound pruning epsilon
 
+    // Root cut loop (#19 Rung-2): generate Gomory MI cuts at the root LP
+    // optimum, add them as rows, re-solve warm — repeat while the bound
+    // improves. Cut rows are appended to root_lp and every child builds
+    // on root_lp (bounds-only deltas), so cuts propagate tree-wide.
+    io::Model root_lp = model;
+    for (int j : ivars) root_lp.integ[j] = 0;
+    {
+        simplex::WarmStart ws;
+        std::vector<simplex::CutRow> cuts;
+        const int ROOT_ROUNDS = 8;
+        double prev_bound = INF;
+        double bound0 = INF;  // pre-cut root bound (cut-worthiness gate)
+        for (int round = 0; round < ROOT_ROUNDS; ++round) {
+            simplex::WarmStart ws_next;
+            Solution r = simplex::solve(root_lp, opt,
+                                        ws.basis.empty() ? nullptr : &ws,
+                                        &ws_next, &cuts, &model.integ);
+            if (r.status != Status::Optimal) break;
+            ws = ws_next;
+            if (std::getenv("IGAOS_DEBUG_CUTS")) {
+                std::fprintf(stderr, "[cuts] round=%d bound=%.6f cuts=%zu\n",
+                             round, r.objective, cuts.size());
+                for (const auto& c : cuts) {
+                    double lhs_eval = 0.0;
+                    for (auto& [j, co] : c.coeffs)
+                        lhs_eval += co * r.x[j];
+                    std::fprintf(stderr, "  cut: nnz=%zu lhs=%.6g eval=%.6g "
+                                         "violation=%.3g\n",
+                                 c.coeffs.size(), c.lhs, lhs_eval,
+                                 lhs_eval - c.lhs);
+                }
+            }
+            if (round == 0) bound0 = r.objective;
+            if (r.objective >= prev_bound - 1e-9 || cuts.empty()) break;
+            prev_bound = r.objective;
+            // append cut rows AND materialize them into the matrix —
+            // the next round solves the augmented model, so the rebuild
+            // must happen inside the loop
+            std::vector<std::tuple<int, int, double>> all;
+            for (int j = 0; j < root_lp.n; ++j)
+                for (int p = root_lp.cp[j]; p < root_lp.cp[j + 1]; ++p)
+                    all.emplace_back(root_lp.ci[p], j, root_lp.acx[p]);
+            for (const auto& cut : cuts) {
+                int newm = root_lp.m++;
+                root_lp.rmin.push_back(cut.lhs);
+                root_lp.rmax.push_back(INF);
+                for (auto& [j, c] : cut.coeffs)
+                    all.emplace_back(newm, j, c);
+            }
+            io::counting_sort(all, root_lp.m, root_lp.n, root_lp.ap,
+                              root_lp.ai, root_lp.ax, root_lp.cp,
+                              root_lp.ci, root_lp.acx);
+            cuts.clear();
+        }
+        // cut-worthiness gate: keep cuts only when they closed the root
+        // bound by >= 1% — otherwise the larger child LPs cost more than
+        // the closure buys (observed: knap25 247 -> 475 nodes with thin
+        // cuts). ponytail: 1% heuristic; per-instance cut selection (cut
+        // aging, orthogonality filters) if the bar demands it
+        bool cuts_worthwhile =
+            std::isfinite(bound0) && std::isfinite(prev_bound) &&
+            prev_bound > bound0 + 0.01 * (1.0 + std::fabs(bound0));
+        if (!cuts_worthwhile && root_lp.m > model.m) {
+            root_lp = model;               // drop the cut rows entirely
+            for (int j : ivars) root_lp.integ[j] = 0;
+        }
+        root.cl = root_lp.cl;
+        root.cu = root_lp.cu;
+    }
+    pool.clear();
+    dive.clear();
+    by_bound.clear();
+    push_node(std::move(root));
+
     auto pop_node = [&]() -> int {
         auto try_dive = [&]() -> int {
             while (!dive.empty()) {
@@ -127,7 +202,7 @@ Solution solve(const io::Model& model, const Options& opt) {
         // prune on inherited bound before paying for an LP solve
         if (has_incumbent && nd.bound > best_obj - GAP_TOL) continue;
 
-        io::Model lp = model;
+        io::Model lp = root_lp;  // includes root Gomory cuts
         lp.cl = nd.cl;
         lp.cu = nd.cu;
         for (int j : ivars) lp.integ[j] = 0;
