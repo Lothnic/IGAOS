@@ -38,6 +38,11 @@ Solution solve(const io::Model& model, const Options& opt) {
     double best_obj = INF;
     std::vector<double> best_x;
     bool has_incumbent = false;
+    // heuristic incumbents prune the tree but do NOT flip the pop rule to
+    // best-bound: DFS diving is what actually finds good incumbents on
+    // weak-bound instances (gt2/ran13x13). Only a tree-proven incumbent
+    // (integral leaf) switches to best-bound for the proof.
+    bool tree_incumbent = false;
     long nodes = 0, solves = 0, lp_failures = 0;
 
     // best-bound + dive (#19): before any incumbent exists we dive
@@ -52,6 +57,9 @@ Solution solve(const io::Model& model, const Options& opt) {
         bool alive = true;
         simplex::WarmStart warm;      // parent's final basis (empty = cold)
         bool warm_valid = false;
+        int bvar = -1;                // var this node branched on (parent's)
+        bool bdown = false;           // which side of the parent branch
+        double bfrac = 0.0;           // parent's fractionality of bvar
     };
     std::vector<Node> pool;
     std::vector<int> dive;  // LIFO stack of pool indices
@@ -79,6 +87,59 @@ Solution solve(const io::Model& model, const Options& opt) {
 
     const double INT_TOL = 1e-6;
     const double GAP_TOL = 1e-9;  // bound pruning epsilon
+    const double FEAS_TOL = 1e-6;
+
+    // Pseudocost branching (#20): accumulate per-var unit objective gains
+    // from the tree's own child LP solves (free — no extra LPs). Selection
+    // score is the classic product form (eps + f*U)(eps + (1-f)*D);
+    // uninitialized vars default to 1.0 which degrades gracefully to
+    // most-fractional. ponytail: no strong branching — add shallow-depth
+    // probing LPs if the free variant stalls short of the target.
+    struct Pseudo {
+        double dsum = 0, usum = 0;
+        long dn = 0, un = 0;
+    };
+    std::vector<Pseudo> pc(model.n);
+    auto pc_down = [&](int j) {
+        return pc[j].dn ? pc[j].dsum / pc[j].dn : 1.0;
+    };
+    auto pc_up = [&](int j) {
+        return pc[j].un ? pc[j].usum / pc[j].un : 1.0;
+    };
+
+    // Incumbent acceptance gate (#20): a heuristic candidate only counts if
+    // it satisfies EVERY original row/bound/integrality of the model as
+    // parsed — never trust the heuristic LP's own feasibility claim.
+    auto validate_vs_model = [&](const std::vector<double>& x) {
+        for (int j = 0; j < model.n; ++j) {
+            if (x[j] < model.cl[j] - FEAS_TOL || x[j] > model.cu[j] + FEAS_TOL)
+                return false;
+            if (model.integ[j] &&
+                std::fabs(x[j] - std::floor(x[j] + 0.5)) > INT_TOL)
+                return false;
+        }
+        for (int i = 0; i < model.m; ++i) {
+            double lhs = 0.0;
+            for (int p = model.ap[i]; p < model.ap[i + 1]; ++p)
+                lhs += model.ax[p] * x[model.ai[p]];
+            if (lhs < model.rmin[i] - FEAS_TOL * (1.0 + std::fabs(model.rmin[i])))
+                return false;
+            if (lhs > model.rmax[i] + FEAS_TOL * (1.0 + std::fabs(model.rmax[i])))
+                return false;
+        }
+        return true;
+    };
+
+    auto try_incumbent = [&](const std::vector<double>& x) {
+        if (!validate_vs_model(x)) return -1;
+        double obj = 0.0;
+        for (int j = 0; j < model.n; ++j) obj += model.c[j] * x[j];
+        if (has_incumbent && obj >= best_obj - GAP_TOL) return 0;
+        best_obj = obj;
+        best_x = x;
+        has_incumbent = true;
+        return 1;
+    };
 
     // Root cut loop (#19 Rung-2): generate Gomory MI cuts at the root LP
     // optimum, add them as rows, re-solve warm — repeat while the bound
@@ -172,8 +233,9 @@ Solution solve(const io::Model& model, const Options& opt) {
             return -1;
         };
         // primary rule per #19 (dive before incumbent, best-bound after),
-        // but never abandon live nodes in the other container
-        if (!has_incumbent) {
+        // but never abandon live nodes in the other container. Mode switch
+        // keys on tree_incumbent, not has_incumbent — see its comment.
+        if (!tree_incumbent) {
             int i = try_dive();
             return i >= 0 ? i : try_bound();
         }
@@ -233,18 +295,182 @@ Solution solve(const io::Model& model, const Options& opt) {
         // LP bound from this node's own relaxation
         if (has_incumbent && r.objective > best_obj - GAP_TOL) continue;
 
+        // free pseudocost update: this node's LP gain over its parent's
+        // bound, per unit branch distance (bfrac is direction-relative:
+        // f for a down child, 1-f for an up child)
+        if (nd.bvar >= 0 && r.objective > nd.bound + GAP_TOL) {
+            double unit =
+                (r.objective - nd.bound) / std::max(nd.bfrac, 1e-6);
+            Pseudo& p = pc[nd.bvar];
+            if (nd.bdown) { p.dsum += unit; ++p.dn; }
+            else          { p.usum += unit; ++p.un; }
+        }
+
         int frac_var = -1;
         double frac_dist = INT_TOL;
+        double best_score = -1.0;
         for (int j : ivars) {
-            double f = std::fabs(r.x[j] - std::floor(r.x[j] + 0.5));
-            if (f > frac_dist && f > INT_TOL) {
-                frac_dist = f;
+            double x = r.x[j];
+            double f = x - std::floor(x);  // up-distance to floor+1 is 1-f
+            double fm = std::min(f, 1.0 - f);
+            if (fm <= INT_TOL) continue;
+            if (fm > frac_dist) frac_dist = fm;  // fallback: most fractional
+            // product score: est. down gain = f*D, est. up gain = (1-f)*U
+            double score = (1e-6 + f * pc_down(j)) *
+                           (1e-6 + (1.0 - f) * pc_up(j));
+            // fractionality factor so uninitialized vars (D=U=1, equal
+            // scores) degrade to most-fractional
+            score *= (0.01 + fm);
+            if (score > best_score) {
+                best_score = score;
                 frac_var = j;
             }
         }
 
         if (frac_var >= 0) {
+            // --- Diving heuristic (#20) -----------------------------------
+            // Two cheap shots at a first incumbent before branching:
+            //   (a) free rounding of the LP solution (no LP solves)
+            //   (b) rounding dive: fix the most-fractional integer var to
+            //       its nearest integer, warm-resolve, repeat until integral
+            //       or infeasible (with one direction flip before giving
+            //       up). Candidates are gated by validate_vs_model — only
+            //       points feasible for the ORIGINAL rows/bounds count.
+            // Runs only while NO incumbent exists: the root / early-DFS
+            // dives are what buy the first feasible point cheaply. Once
+            // any incumbent is in, every LP goes to the proof tree —
+            // measured on flugpl, post-incumbent dives cost 3x wall time
+            // for ~zero accepted improvements (bound-aborted dives at
+            // every-16th node included).
+            if (!has_incumbent) {
+                // (a) pure rounding, three biases (nearest / floor /
+                // ceil) — no LPs, validation-gated; covering models tend
+                // to round up, packing models down
+                {
+                    const double bias[3] = {0.5, 1.0 - 1e-9, 1e-9};
+                    for (int b = 0; b < 3; ++b) {
+                        if (b > 0 && nodes > 100) break;  // nearest-only later on
+                        std::vector<double> xr = r.x;
+                        for (int j : ivars) {
+                            double v = std::floor(xr[j] + bias[b]);
+                            xr[j] = std::min(std::max(v, model.cl[j]),
+                                            model.cu[j]);
+                        }
+                        if (try_incumbent(xr) == 1) break;
+                    }
+                }
+                // (b) rounding dive — cheap warm LPs off the node basis.
+                // At the root both directions run (nearest first: blend2's
+                // incumbent 8.10 vs 40.1 guided; guided second: ran13x13
+                // 3566 -> 3487); deeper nodes run nearest only
+                if (child_warm_valid &&
+                    elapsed() < opt.time_limit_s - 0.5) {
+                  for (int dpass = 0; dpass < (nodes <= 1 ? 2 : 1); ++dpass) {
+                    static long dbg_dives = 0, dbg_fail = 0, dbg_int = 0,
+                                dbg_rej = 0, dbg_notbetter = 0, dbg_acc = 0;
+                    ++dbg_dives;
+                    std::vector<double> xd = r.x;
+                    simplex::WarmStart ws = child_warm, ws_next;
+                    const int DIVE_MAX = (int)ivars.size() + 4;
+                    for (int step = 0; step < DIVE_MAX; ++step) {
+                        if (elapsed() > opt.time_limit_s - 0.25) break;
+                        int fv = -1;
+                        double fd = INT_TOL;
+                        for (int j : ivars) {
+                            double f = std::fabs(xd[j] - std::floor(xd[j] + 0.5));
+                            if (f > fd) { fd = f; fv = j; }
+                        }
+                        if (fv < 0) {
+                            ++dbg_int;
+                            {
+                                int tr = try_incumbent(xd);
+                                if (tr < 0) ++dbg_rej; else if (tr == 0) ++dbg_notbetter; else ++dbg_acc;
+                            }
+                            break;
+                        }
+                        double fl = std::floor(xd[fv]);
+                        double fr = xd[fv] - fl;
+                        // pass 1 (root only): pseudocost-guided — dive
+                        // toward the smaller estimated objective gain
+                        bool down = dpass == 0
+                                        ? fr < 0.5
+                                        : fr * pc_down(fv) <=
+                                              (1.0 - fr) * pc_up(fv);
+                        // last-feasible snapshot for the final-rounding
+                        // fallback when every fix direction dies
+                        std::vector<double> xlast = xd;
+                        double old_cl = lp.cl[fv], old_cu = lp.cu[fv];
+                        bool solved = false;
+                        for (int dir = 0; dir < 2 && !solved; ++dir) {
+                            bool go_down = dir == 0 ? down : !down;
+                            lp.cl[fv] = old_cl;
+                            lp.cu[fv] = old_cu;
+                            if (go_down) lp.cu[fv] = fl;
+                            else         lp.cl[fv] = fl + 1.0;
+                            if (lp.cl[fv] > lp.cu[fv]) continue;
+                            ++solves;
+                            Solution dr = simplex::solve(lp, opt, &ws,
+                                                         &ws_next);
+                            if (dr.status == Status::Error ||
+                                dr.status == Status::Infeasible) {
+                                // warm start landed primal-infeasible (same
+                                // phase-1 limitation as child nodes) — one
+                                // cold retry before declaring this
+                                // direction dead
+                                ++solves;
+                                dr = simplex::solve(lp, opt, nullptr,
+                                                    &ws_next);
+                            }
+                            if (dr.status != Status::Optimal &&
+                                dr.status != Status::NearOptimal &&
+                                dr.status != Status::Feasible)
+                                continue;
+                            ws = ws_next;
+                            xd = dr.x;
+                            solved = true;
+                            // bound-abort: a dive whose LP bound can no
+                            // longer beat the incumbent is dead
+                            if (has_incumbent &&
+                                dr.objective > best_obj - GAP_TOL)
+                                step = DIVE_MAX;
+                        }
+                        if (!solved) {
+                            lp.cl[fv] = old_cl;
+                            lp.cu[fv] = old_cu;
+                            ++dbg_fail;
+                            if (std::getenv("IGAOS_DEBUG_DIVE"))
+                                std::fprintf(stderr,
+                                             "[dive] abort step=%d var=%d "
+                                             "val=%.4f\n",
+                                             step, fv, xlast[fv]);
+                            // final rounding: last feasible LP point with
+                            // the remaining fractional vars rounded —
+                            // validation gate rejects it if rows break
+                            for (int j : ivars) {
+                                double v = std::floor(xlast[j] + 0.5);
+                                xlast[j] = std::min(std::max(v, model.cl[j]),
+                                                    model.cu[j]);
+                            }
+                            ++dbg_int;
+                            {
+                                int tr = try_incumbent(xlast);
+                                if (tr < 0) ++dbg_rej; else if (tr == 0) ++dbg_notbetter; else ++dbg_acc;
+                            }
+                            break;
+                        }
+                    }
+                    if (std::getenv("IGAOS_DEBUG_DIVE") && dbg_dives % 200 == 1)
+                        std::fprintf(stderr,
+                                     "[dive] dives=%ld fail=%ld int=%ld "
+                                     "rej=%ld notbetter=%ld acc=%ld\n",
+                                     dbg_dives, dbg_fail, dbg_int, dbg_rej,
+                                     dbg_notbetter, dbg_acc);
+                  }
+                }
+            }
+            // ------------------------------------------------------------
             double fl = std::floor(r.x[frac_var]);
+            double f = r.x[frac_var] - fl;  // direction-relative distances
             Node down = nd, upn = nd;
             down.cu[frac_var] = std::min(nd.cu[frac_var], fl);
             down.bound = r.objective;
@@ -253,6 +479,9 @@ Solution solve(const io::Model& model, const Options& opt) {
             down.depth = upn.depth = nd.depth + 1;
             down.warm = upn.warm = child_warm;
             down.warm_valid = upn.warm_valid = child_warm_valid;
+            down.bvar = upn.bvar = frac_var;
+            down.bdown = true;  upn.bdown = false;
+            down.bfrac = f;     upn.bfrac = 1.0 - f;
             if (down.cl[frac_var] <= down.cu[frac_var])
                 push_node(std::move(down));
             if (upn.cl[frac_var] <= upn.cu[frac_var])
@@ -264,6 +493,7 @@ Solution solve(const io::Model& model, const Options& opt) {
             best_obj = r.objective;
             best_x = r.x;
             has_incumbent = true;
+            tree_incumbent = true;
         }
     }
 
