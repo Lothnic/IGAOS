@@ -307,7 +307,8 @@ Solution solve(const io::Model& model, const Options& opt,
         return -1;
     };
 
-    DenseLU lu;
+    EtaFile lu;
+    bool basis_dirty = true;  // eta file must be rebuilt from scratch
     vector<double> zb(E.m, 0.0);
     auto build_and_factor = [&]() {
         vector<double> Bm((size_t)E.m * E.m, 0.0), col;
@@ -317,6 +318,7 @@ Solution solve(const io::Model& model, const Options& opt,
                 if (col[r] != 0.0) Bm[(size_t)r * E.m + c] = col[r];
         }
         lu.factor(std::move(Bm));
+        basis_dirty = false;  // eta file now matches `basis`
         return lu.ok;
     };
     auto refresh_values = [&]() {
@@ -348,6 +350,7 @@ Solution solve(const io::Model& model, const Options& opt,
     auto run_simplex = [&](bool phase1) -> int {
         std::fill(skip_col.begin(), skip_col.end(), 0);
         accept_unsafe = false;
+        basis_dirty = true;  // force a factorization at phase entry
         auto verify_pivot_invariant = [&](const char* tag, int enter,
                                           int lpos, long lvar, double th,
                                           double dr) {
@@ -426,20 +429,25 @@ Solution solve(const io::Model& model, const Options& opt,
                     else st[j] = FREE_NB;
                 }
 
-                if (!build_and_factor()) {
-                    if (rec_enter >= 0) {
-                        // the last pivot singularized the basis — roll it
-                        // back and reject that entering column
-                        basis = rec_basis;
-                        st = rec_st;
-                        skip_col[rec_enter] = 1;
-                        rec_enter = -1;
-                        continue;
+                if (basis_dirty || lu.needs_refactor()) {
+                    if (!build_and_factor()) {
+                        if (rec_enter >= 0) {
+                            // the last pivot singularized the basis —
+                            // roll it back and reject that entering column
+                            basis = rec_basis;
+                            st = rec_st;
+                            skip_col[rec_enter] = 1;
+                            rec_enter = -1;
+                            basis_dirty = true;  // etas are stale
+                            continue;
+                        }
+                        sol.status = Status::Error;
+                        sol.message = "basis factorization failed";
+                        return 5;
                     }
-                    sol.status = Status::Error;
-                    sol.message = "basis factorization failed";
-                    return 5;
+                    basis_dirty = false;
                 }
+                refresh_values();
                 refresh_values();
             }
             if (opt.verbosity > 2) {
@@ -864,6 +872,8 @@ Solution solve(const io::Model& model, const Options& opt,
             basis[leave_pos] = enter0;
             st[enter0] = BASIC;
             zb[leave_pos] = z[enter0];
+            // product-form update: B_new = B_old · E(leave_pos, alpha)
+            lu.update(leave_pos, alpha);
             verify_pivot_invariant("pivot", enter0, leave_pos, leaving,
                                    theta, dir0);
 
