@@ -36,7 +36,7 @@ pybind11 surface.
 
 | Evidence | Result | Artifact |
 |---|---|---|
-| Netlib LP ladder (64 inst ≤700 rows) | **50/64 exact vs HiGHS** (78%) | `docs/research/sweep_results.csv`, `demo/regress_netlib.py` |
+| Netlib LP ladder (64 inst ≤700 rows) | **52/64 exact vs HiGHS** (81%) | `docs/research/sweep_results.csv`, `demo/regress_netlib.py` |
 | False-unbounded bug class | fixed (pilot4 exact; perold honest error) | commit `4c49d09` |
 | Infeasibility detection | klein1 + refinery **proven** infeasible | `docs/research/robustness_results.csv` |
 | MPS edge cases | RANGES/FR/objective-constant correct (e226 exact) | `src/io/model.hpp` |
@@ -45,23 +45,30 @@ pybind11 surface.
 ## Slide 6 — Innovation
 
 - First-order GPU LP (restarted adaptive PDHG: Halpern averaging,
-  KKT-error restarts) in a from-scratch sovereign core.
+  KKT-error restarts, residual-balanced steps) in a from-scratch
+  sovereign core — every engine implemented from mathematical
+  foundations: primal+dual revised simplex, product-form eta updates,
+  Gomory MI cuts, OSQP-style ADMM QP.
 - Honest crossover: GPU wins above ~1M-nnz; small LPs stay CPU.
 
 ## Slide 7 — Benchmark honesty
 
 - Pinned HiGHS v1.15.1 baseline; Netlib + MIPLIB 2017 (v36 solufile)
   protocol; `solved@1e-4 / tight@1e-6` ladder.
-- Robustness suite: 9/15 per-class PASS (degeneracy, ill-conditioning,
+- Robustness suite: 10/15 per-class PASS (degeneracy, ill-conditioning,
   RANGES, free columns, infeasibility).
-- MIPLIB starter subset: **[MIPLIB]** (target ≥12/20 @1e-4).
+- MIPLIB starter subset: **6/20 @1e-4** (flugpl 3.4s, air03 5.9s,
+  khb05250 32.2s proven optimal; 10/20 honest feasible incumbents) —
+  `docs/research/miplib_results.txt`. Target ≥12/20.
 - Artifacts: `docs/research/benchmark-protocol.md`,
   `demo/bench_robustness.py`, `benchmarks/suites/robustness.yaml`
 
 ## Slide 8 — MRPL fit
 
 - Williams refinery LP solved to published optimum (−211365.13).
-- Haverly pooling at three honesty levels (L0 done; L1 QP is P2).
+- Haverly pooling at three honesty levels: L0 LP relaxation AND L1
+  convex QP both solved; L1 verified three ways (KKT, HiGHS cross-check,
+  L0-bound consistency: −496.00 / −2196.00 vs HiGHS identical).
 - MRPL-domain infeasible LP (`refinery`) correctly proven infeasible.
 - Artifacts: `demo/models/`, `docs/research/refinery-case-studies.md`
 
