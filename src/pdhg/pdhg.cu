@@ -85,6 +85,7 @@ static constexpr double INF_NAN = std::numeric_limits<double>::infinity();
 
 struct Metrics {
     double pinf, dinf, gap, op, od;
+    double prow;  // max per-row violation / (1 + row's own scale)
     bool finite_res() const {
         return std::isfinite(pinf) && std::isfinite(dinf);
     }
@@ -102,13 +103,26 @@ Metrics evaluate(int m, int n, const std::vector<double>& rmin,
                  const std::vector<double>& d) {
     const double INF = std::numeric_limits<double>::infinity();
     Metrics mt{};
-    double pv = 0.0, pa = 0.0;
+    double pv = 0.0, pa = 0.0, prow = 0.0;
     for (int i = 0; i < m; ++i) {
         pv = std::max(pv, std::max(rmin[i] - Ax[i], Ax[i] - rmax[i]));
         pa = std::max(pa,
                       std::fabs(std::min(std::max(Ax[i], rmin[i]), rmax[i])));
+        // per-row relative violation: pinf's (1+pa) normalizer hides big
+        // absolute violations on large-scale rows (adlittle: 0.1 abs
+        // violation at pinf 4e-5 bought 383 of objective). Certification
+        // requires this per-row measure instead.
+        double viol = std::max(
+            0.0, std::max(rmin[i] - Ax[i], Ax[i] - rmax[i]));
+        double sc = std::fabs(Ax[i]);
+        if (std::isfinite(rmin[i]))
+            sc = std::max(sc, std::fabs(rmin[i]));
+        if (std::isfinite(rmax[i]))
+            sc = std::max(sc, std::fabs(rmax[i]));
+        prow = std::max(prow, viol / (1.0 + sc));
     }
     mt.pinf = std::max(pv, 0.0) / (1.0 + pa);
+    mt.prow = prow;
     double dv = 0.0;
     for (int j = 0; j < n; ++j) {
         double bnd =
@@ -163,8 +177,207 @@ Metrics evaluate(int m, int n, const std::vector<double>& rmin,
                      : INF;
     return mt;
 }
+// Cholesky factorization of a symmetric PD matrix in place (lower
+// triangle, row-major, stride nr). Returns false if not PD.
+bool chol_factor(std::vector<double>& G, int nr) {
+    for (int i = 0; i < nr; ++i) {
+        for (int j = 0; j <= i; ++j) {
+            double s = G[i * nr + j];
+            for (int t = 0; t < j; ++t) s -= G[i * nr + t] * G[j * nr + t];
+            if (i == j) {
+                if (!(s > 0)) return false;
+                G[i * nr + i] = std::sqrt(s);
+            } else {
+                G[i * nr + j] = s / G[j * nr + j];
+            }
+        }
+    }
+    return true;
+}
+
+// Solve with a chol_factor'd matrix; rhs in place.
+void chol_apply(const std::vector<double>& G, int nr,
+                std::vector<double>& rhs) {
+    for (int i = 0; i < nr; ++i) {
+        double s = rhs[i];
+        for (int t = 0; t < i; ++t) s -= G[i * nr + t] * rhs[t];
+        rhs[i] = s / G[i * nr + i];
+    }
+    for (int i = nr - 1; i >= 0; --i) {
+        double s = rhs[i];
+        for (int t = i + 1; t < nr; ++t) s -= G[t * nr + i] * rhs[t];
+        rhs[i] = s / G[i * nr + i];
+    }
+}
+
+bool dual_repair(const io::Model& lp, const std::vector<double>& x,
+                 const std::vector<double>& Ax,
+                 const std::vector<double>& y_it, double col_tol,
+                 std::vector<double>& y) {
+    const int m = lp.m, n = lp.n;
+    const double NL = -std::numeric_limits<double>::infinity();
+    const double PL = std::numeric_limits<double>::infinity();
+    std::vector<double> lo(m), hi(m);
+    for (int i = 0; i < m; ++i) {
+        bool fin_lo = std::isfinite(lp.rmin[i]);
+        bool fin_hi = std::isfinite(lp.rmax[i]);
+        if (fin_lo && fin_hi) { lo[i] = NL; hi[i] = PL; }
+        else if (fin_hi)      { lo[i] = 0.0; hi[i] = PL; }
+        else if (fin_lo)      { lo[i] = NL; hi[i] = 0.0; }
+        else                  { lo[i] = hi[i] = 0.0; }
+    }
+    // column constraint types: 0: d>=0 (cu=inf), 1: d<=0 (cl=-inf),
+    // 2: d==0 (both inf), 3: free (both finite)
+    std::vector<char> ct(n, 3);
+    std::vector<double> cn2(n, 0.0);
+    std::vector<int> ji;
+    for (int j = 0; j < n; ++j) {
+        bool up_inf = !std::isfinite(lp.cu[j]);
+        bool lo_inf = !std::isfinite(lp.cl[j]);
+        ct[j] = (up_inf && lo_inf) ? 2 : up_inf ? 0 : lo_inf ? 1 : 3;
+        for (int p = lp.cp[j]; p < lp.cp[j + 1]; ++p)
+            cn2[j] += lp.acx[p] * lp.acx[p];
+        // interior: x strictly off both bounds -> d_j must be 0
+        auto btol = [&](double tol, double b) {
+            return tol * (1.0 + (std::isfinite(b) ? std::fabs(b) : 0.0));
+        };
+        if (x[j] - lp.cl[j] > btol(col_tol, lp.cl[j]) &&
+            lp.cu[j] - x[j] > btol(col_tol, lp.cu[j]))
+            ji.push_back(j);
+    }
+    const int k = (int)ji.size();
+    // G = A_JI A_JI' + ridge I, factored once
+    std::vector<double> G;
+    if (k > 0) {
+        G.assign(m * m, 0.0);
+        for (int jj = 0; jj < k; ++jj) {
+            const int j = ji[jj];
+            for (int p = lp.cp[j]; p < lp.cp[j + 1]; ++p) {
+                const int i1 = lp.ci[p];
+                const double v1 = lp.acx[p];
+                for (int q = lp.cp[j]; q < lp.cp[j + 1]; ++q)
+                    G[i1 * m + lp.ci[q]] += v1 * lp.acx[q];
+            }
+        }
+        double tr = 0.0;
+        for (int i = 0; i < m; ++i) tr += G[i * m + i];
+        double ridge = tr > 0 ? 1e-10 * tr / m : 1e-14;
+        bool ok = false;
+        for (int att = 0; att < 6 && !ok; ++att) {
+            std::vector<double> Gc = G;
+            for (int i = 0; i < m; ++i) Gc[i * m + i] += ridge;
+            ok = chol_factor(Gc, m);
+            if (ok) G = Gc;
+            else ridge = ridge > 0 ? ridge * 100.0 : 1e-14;
+        }
+        if (!ok) return false;
+    }
+    double best_gap = std::numeric_limits<double>::infinity();
+    bool have = false;
+    std::vector<double> d(n), rhs(m), yc(m), ybest;
+    double best_viol = std::numeric_limits<double>::infinity();
+    std::vector<double> yviol;
+    for (int anch = 0; anch < 2; ++anch) {
+        yc = anch == 0 ? y_it : std::vector<double>(m, 0.0);
+        for (int i = 0; i < m; ++i)
+            yc[i] = std::min(std::max(yc[i], lo[i]), hi[i]);
+        // decay-rate abort: hopeless projections (wrong active set, far
+        // anchor) plateau; without this each failed attempt burns
+        // ~0.3s of host time and march-dominated runs (sc205) lose ~40%
+        // of their iteration budget
+        double vref = -1.0;
+        for (int it = 0; it < 300; ++it) {
+            // affine projection: e = G^-1 (-A_JI d_JI)
+            if (k > 0) {
+                std::fill(rhs.begin(), rhs.end(), 0.0);
+                double res2 = 0.0;
+                for (int jj = 0; jj < k; ++jj) {
+                    const int j = ji[jj];
+                    double dj = lp.c[j];
+                    for (int p = lp.cp[j]; p < lp.cp[j + 1]; ++p)
+                        dj += lp.acx[p] * yc[lp.ci[p]];
+                    res2 += dj * dj;
+                    if (dj != 0.0)
+                        for (int p = lp.cp[j]; p < lp.cp[j + 1]; ++p)
+                            rhs[lp.ci[p]] -= lp.acx[p] * dj;
+                }
+                if (res2 > 0.0) {
+                    chol_apply(G, m, rhs);
+                    for (int i = 0; i < m; ++i) yc[i] += rhs[i];
+                }
+            }
+            // Hildreth halfspace fixes for sign-constrained columns
+            for (int j = 0; j < n; ++j) {
+                if (ct[j] == 3 || cn2[j] == 0.0) continue;
+                double dj = lp.c[j];
+                for (int p = lp.cp[j]; p < lp.cp[j + 1]; ++p)
+                    dj += lp.acx[p] * yc[lp.ci[p]];
+                double v = 0.0;
+                if (ct[j] == 0 && dj < 0.0) v = -dj;
+                else if (ct[j] == 1 && dj > 0.0) v = -dj;
+                else if (ct[j] == 2 && dj != 0.0) v = -dj;
+                if (v != 0.0) {
+                    double st = v / cn2[j];
+                    for (int p = lp.cp[j]; p < lp.cp[j + 1]; ++p)
+                        yc[lp.ci[p]] += st * lp.acx[p];
+                }
+            }
+            // row cone
+            for (int i = 0; i < m; ++i)
+                yc[i] = std::min(std::max(yc[i], lo[i]), hi[i]);
+            for (int j = 0; j < n; ++j) {
+                double dj = lp.c[j];
+                for (int p = lp.cp[j]; p < lp.cp[j + 1]; ++p)
+                    dj += lp.acx[p] * yc[lp.ci[p]];
+                d[j] = dj;
+            }
+            if (it % 25 == 0) {
+                double viol = 0.0;
+                for (int j = 0; j < n; ++j) {
+                    if (ct[j] == 3) continue;
+                    double v = 0.0;
+                    if (ct[j] == 0 && d[j] < 0) v = -d[j];
+                    else if (ct[j] == 1 && d[j] > 0) v = d[j];
+                    else if (ct[j] == 2) v = std::fabs(d[j]);
+                    viol = std::max(viol, v);
+                }
+                for (int i = 0; i < m; ++i) {
+                    double v = 0.0;
+                    if (lo[i] == 0.0 && hi[i] == 0.0)
+                        v = std::fabs(yc[i]);
+                    else if (hi[i] == 0.0 && yc[i] > 0) v = yc[i];
+                    else if (lo[i] == 0.0 && yc[i] < 0) v = -yc[i];
+                    viol = std::max(viol, v);
+                }
+                if (it == 25) vref = viol;
+                if (viol < best_viol) {
+                    best_viol = viol;
+                    yviol = yc;
+                }
+                if (it == 100 && vref > 0 && viol > 0.25 * vref) break;
+            }
+            Metrics t = evaluate(m, n, lp.rmin, lp.rmax, lp.cl, lp.cu, lp.c,
+                                 x, yc, Ax, d);
+            if (std::isfinite(t.gap) && t.gap < best_gap) {
+                best_gap = t.gap;
+                ybest = yc;
+                have = true;
+            }
+        }
+    }
+    // no certifying dual found; still expose the best-by-violation POCS
+    // point so the caller can use it as a dual-restart anchor (grow22
+    // basin escape)
+    y = have ? ybest : yviol;
+    return have;
+}
 
 }  // namespace
+
+
+
+
+
 
 Solution solve(const io::Model& lp, const Options& opt) {
     Solution sol;
@@ -401,6 +614,9 @@ Solution solve(const io::Model& lp, const Options& opt) {
     double boom_cap = std::numeric_limits<double>::infinity();
     std::vector<double> yprev(m, 0.0), xprev(n, 0.0);
     bool have_prev = false;
+    long next_repair = 5000;   // dual-repair attempt schedule (backoff)
+    bool repaired = false;
+    long repair_spacing = 2000;
     long k = 1;
     for (; k <= MAXIT; ++k) {
         iters_run = k;
@@ -452,11 +668,102 @@ Solution solve(const io::Model& lp, const Options& opt) {
             // acceptance returns wrong objectives (sc205, adlittle):
             // dinf/pinf do not bound the objective error.
             auto passes = [&](const Metrics& t) {
-                return t.pinf <= TOL && t.dinf <= TOL &&
+                return t.pinf <= TOL && t.dinf <= TOL && t.prow <= TOL &&
                        std::isfinite(t.gap) && t.gap <= TOL;
             };
             if (passes(mc)) { last = mc; last_is_avg = false; break; }
             if (passes(ma)) { last = ma; last_is_avg = true; break; }
+
+            // Dual repair when only certification lags: a candidate's
+            // residuals are at tolerance but its gap is not certifiable
+            // (the iterate's y is ~1e-6 short of exact dual feasibility at
+            // the infinite bounds, so the Lagrangian bound is -inf).
+            // Exactly project the dual onto the feasible region (strictly
+            // convex QP, dual active-set) and re-evaluate the bound. Weak
+            // duality holds for ANY y and evaluate() re-verifies every
+            // sign before a bound is accepted, so a failed projection can
+            // only fail to certify — never certify a false gap.
+            // ponytail: dense working-set solves on host; the dinf gate
+            // keeps march-dominated runs (sc205, grow22) from paying for
+            // hopeless attempts.
+            if (k >= 5000 && k >= next_repair) {
+                next_repair = k + repair_spacing;
+                repair_spacing = std::min(repair_spacing * 3, 30000L);
+                for (int c = 1; c <= 2; ++c) {
+                    const Metrics& t = c == 1 ? ma : inc;
+                    if (c == 2 && !have_inc) break;
+                    if (!(t.pinf <= TOL && t.prow <= TOL &&
+                          t.dinf <= 10.0 * TOL &&
+                          !(std::isfinite(t.gap) && t.gap <= TOL)))
+                        continue;
+                    std::vector<double> rx(n), ry_it(m), ry(m);
+                    const double* dxs = c == 1 ? d_xavg : d_xb;
+                    double* dys = c == 1 ? d_yavg : d_y;
+                    CK(cudaMemcpy(rx.data(), dxs, n * sizeof(double),
+                                  cudaMemcpyDeviceToHost));
+                    for (int j = 0; j < n; ++j) rx[j] *= dc[j];
+                    CK(cudaMemcpy(ry_it.data(), dys, m * sizeof(double),
+                                  cudaMemcpyDeviceToHost));
+                    for (int i = 0; i < m; ++i)
+                        ry_it[i] = gamma * ry_it[i] / dr[i];
+                    std::vector<double> rAx(m, 0.0);
+                    for (int j = 0; j < n; ++j)
+                        for (int p = lp.cp[j]; p < lp.cp[j + 1]; ++p)
+                            rAx[lp.ci[p]] += lp.acx[p] * rx[j];
+                    // col_tol ladder: the averaged point keeps small-x
+                    // nonbasic columns interior; counting them makes the
+                    // equality system inconsistent. A looser tier drops
+                    // them and leaves the consistent basis system.
+                    static const double ct[2] = {1e-6, 1e-1};
+                    bool ok_rep = false;
+                    Metrics mr{};
+                    for (int tier = 0; tier < 2 && !ok_rep; ++tier) {
+                        if (!dual_repair(lp, rx, rAx, ry_it, ct[tier], ry))
+                            continue;
+                        std::vector<double> rd(n);
+                        for (int j = 0; j < n; ++j) {
+                            rd[j] = lp.c[j];
+                            for (int p = lp.cp[j]; p < lp.cp[j + 1]; ++p)
+                                rd[j] += lp.acx[p] * ry[lp.ci[p]];
+                        }
+                        Metrics t = evaluate(m, n, lp.rmin, lp.rmax, lp.cl,
+                                             lp.cu, lp.c, rx, ry, rAx, rd);
+                        // Acceptance for a REPAIRED pair is pinf + prow +
+                        // gap: the gap is a valid weak-duality bound for
+                        // any y, so together with x's feasibility it IS
+                        // the certificate — the repaired dual's own dinf
+                        // is redundant (it is not the iterate's residual).
+                        if (t.pinf <= TOL && t.prow <= TOL &&
+                            std::isfinite(t.gap) && t.gap <= TOL) {
+                            ok_rep = true;
+                            mr = t;
+                        }
+                    }
+                    if (!ok_rep) continue;
+                    // adopt: write the repaired dual back so the standard
+                    // output path reports it verbatim
+                    {
+                        std::vector<double> sy(m);
+                        for (int i = 0; i < m; ++i)
+                            sy[i] = ry[i] * dr[i] / gamma;
+                        CK(cudaMemcpy(dys, sy.data(), m * sizeof(double),
+                                      cudaMemcpyHostToDevice));
+                    }
+                    if (c == 2)
+                        CK(cudaMemcpy(d_x, d_xb, n * sizeof(double),
+                                      cudaMemcpyDeviceToDevice));
+                    if (opt.verbosity > 1)
+                        std::fprintf(stderr,
+                                     "[pdhg] dual repair c=%d @k=%ld "
+                                     "gap=%.3e\n",
+                                     c, k, mr.gap);
+                    last = mr;
+                    last_is_avg = (c == 1);
+                    repaired = true;
+                    break;
+                }
+                if (repaired) break;
+            }
 
             // Step-size controller. In the march regime the product
             // tau*sigma only ever shrinks below prod0 (growth re-pins it);
@@ -624,8 +931,13 @@ Solution solve(const io::Model& lp, const Options& opt) {
                       std::chrono::steady_clock::now() - t0)
                       .count();
 
+    // Final status: pinf + prow + a certified duality gap. The gap is a
+    // weak-duality bound, so together with x's feasibility it bounds the
+    // objective error — dinf is redundant for the guarantee (the loop's
+    // passes() still keeps it as a stricter early-exit gate for iterate
+    // pairs, but a repaired dual's dinf measures a different y).
     auto certified = [&](const Metrics& t) {
-        return t.pinf <= TOL && t.dinf <= TOL && std::isfinite(t.gap) &&
+        return t.pinf <= TOL && t.prow <= TOL && std::isfinite(t.gap) &&
                t.gap <= TOL;
     };
 
