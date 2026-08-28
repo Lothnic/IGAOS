@@ -12,7 +12,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 MPLIB = ROOT / "benchmarks/miplib2017"
-BIN = ROOT / "build/src/api/igaos"
+BIN = Path(__import__("os").environ.get(
+    "IGAOS_BIN", ROOT / "build/src/api/igaos"))
 SOLU = MPLIB / "miplib2017-v36.solu"
 TIME_LIMIT = int(__import__("os").environ.get("MIP_TL", "60"))
 

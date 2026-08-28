@@ -15,7 +15,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 FULL = ROOT / "demo/models/netlib_full"
-BIN = ROOT / "build/src/api/igaos"
+BIN = Path(__import__("os").environ.get(
+    "IGAOS_BIN", ROOT / "build/src/api/igaos"))
 REF = ROOT / "docs/research/sweep_results.csv"
 TL = 30  # generous uniform cap; earlier runs used 20
 

@@ -15,7 +15,8 @@ import yaml
 
 ROOT = Path(__file__).resolve().parent.parent
 SUITE = ROOT / "benchmarks/suites/robustness.yaml"
-BIN = ROOT / "build/src/api/igaos"
+BIN = Path(__import__("os").environ.get(
+    "IGAOS_BIN", ROOT / "build/src/api/igaos"))
 OUT = ROOT / "docs/research/robustness_results.csv"
 
 TIER_TL = {"T0": 60, "T1": 60, "T2": 300, "T3": 300}
