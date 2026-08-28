@@ -742,6 +742,13 @@ Solution solve(const io::Model& model, const Options& opt,
                                : (E.up[enter0] - E.lo[enter0]);
 
             if ((leave_pos < 0 || theta > range) && !std::isfinite(range)) {
+                if (phase1) {
+                    // phase-1 unboundedness is impossible (art objective
+                    // bounded below by 0) — always a numerical artifact;
+                    // skip the column and reprice
+                    skip_col[enter0] = 1;
+                    continue;
+                }
                 if (std::isfinite(theta_rel) && !accept_unsafe) {
                     // blocked (finite ratio exists) but no stable pivot —
                     // reject this column, reprice
