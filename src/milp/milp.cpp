@@ -17,6 +17,10 @@ namespace igaos::milp {
 using std::numeric_limits;
 constexpr double INF = std::numeric_limits<double>::infinity();
 
+// RINS sub-solves recurse into solve() at depth 1: their cut rounds and
+// nested RINS are disabled (a sub-MIP this small needs neither)
+static thread_local int sub_depth = 0;
+
 Solution solve(const io::Model& model, const Options& opt) {
     Solution sol;
     auto t0 = std::chrono::steady_clock::now();
@@ -64,10 +68,20 @@ Solution solve(const io::Model& model, const Options& opt) {
     std::vector<Node> pool;
     std::vector<int> dive;  // LIFO stack of pool indices
     // ponytail: index multiset bound-major — fine to 1e5 nodes; a pairing
-    // heap if node counts grow 100x
+    // heap if node counts grow 100x.
+    // STRICT order on indices (#21 bug fix): the old comparator returned
+    // "equivalent" for any two nodes with equal (bound, depth) — i.e.
+    // SIBLINGS, the common case — so by_bound.erase(idx) (key-erase
+    // removes ALL equivalent keys) silently erased the popped node's
+    // sibling too. The multiset was perpetually gutted and the
+    // "best-bound" proof mode never actually ran (pure DFS). The index
+    // tiebreak makes erase(idx) remove exactly idx.
     auto bound_worse = [&](int a, int b) {
-        if (pool[a].bound != pool[b].bound) return pool[a].bound > pool[b].bound;
-        return pool[a].depth < pool[b].depth;
+        if (pool[a].bound != pool[b].bound)
+            return pool[a].bound < pool[b].bound;  // begin() = best (min) bound
+        if (pool[a].depth != pool[b].depth)
+            return pool[a].depth > pool[b].depth;  // ties: deepest first
+        return a < b;
     };
     std::multiset<int, decltype(bound_worse)> by_bound(bound_worse);
 
@@ -141,6 +155,70 @@ Solution solve(const io::Model& model, const Options& opt) {
         return 1;
     };
 
+    // RINS-style incumbent improvement (#21): periodically solve a
+    // restriction of the ORIGINAL model — integer vars where the node LP
+    // and the incumbent AGREE are fixed, the rest stay integer — under a
+    // cutoff row c^T x <= best-eps that forces a strictly better point.
+    // The sub-MIP goes through solve() itself, so its dives/heuristics
+    // come along for free; candidates still pass validate_vs_model.
+    // Budget: 15% of wall clock total, never the last 20% of the clock.
+    double rins_spent = 0.0;
+    long rins_last_node = -1;
+    double rins_last_best = INF;
+    auto run_rins = [&](const std::vector<double>& lpx) {
+        if (sub_depth > 0 || !has_incumbent) return;
+        double budget_left = 0.15 * opt.time_limit_s - rins_spent;
+        double slice = std::min(std::min(5.0, budget_left),
+                                0.25 * (opt.time_limit_s - elapsed()));
+        if (slice < 0.5 ||
+            elapsed() > 0.8 * opt.time_limit_s)
+            return;
+        io::Model sub = model;  // integrality kept
+        int nfix = 0;
+        for (int j : ivars) {
+            double v = best_x[j];
+            if (std::fabs(lpx[j] - v) <= 1e-6) {
+                sub.cl[j] = sub.cu[j] = v;
+                ++nfix;
+            }
+        }
+        // cutoff row: c^T x <= best_obj - eps (append + rebuild matrix)
+        int newm = sub.m++;
+        sub.rmin.push_back(-INF);
+        sub.rmax.push_back(best_obj -
+                           1e-6 * (1.0 + std::fabs(best_obj)));
+        std::vector<std::tuple<int, int, double>> all;
+        for (int j = 0; j < sub.n; ++j)
+            for (int p = sub.cp[j]; p < sub.cp[j + 1]; ++p)
+                all.emplace_back(sub.ci[p], j, sub.acx[p]);
+        for (int j = 0; j < sub.n; ++j)
+            if (model.c[j] != 0.0) all.emplace_back(newm, j, model.c[j]);
+        io::counting_sort(all, sub.m, sub.n, sub.ap, sub.ai, sub.ax,
+                          sub.cp, sub.ci, sub.acx);
+        Options sopt = opt;
+        sopt.time_limit_s = slice;
+        sopt.max_iterations =
+            std::min(opt.max_iterations, (long)5000);
+        double t0 = elapsed();
+        ++sub_depth;
+        Solution s = solve(sub, sopt);
+        --sub_depth;
+        rins_spent += elapsed() - t0;
+        rins_last_node = nodes;
+        rins_last_best = best_obj;
+        if ((s.status == Status::Optimal ||
+             s.status == Status::Feasible) &&
+            (int)s.x.size() == model.n) {
+            try_incumbent(s.x);
+        }
+        if (std::getenv("IGAOS_DEBUG_RINS"))
+            std::fprintf(stderr,
+                         "[rins] node=%ld fix=%d/%zu slice=%.2fs st=%d "
+                         "obj=%.6g best=%.6g\n",
+                         nodes, nfix, ivars.size(), slice, (int)s.status,
+                         s.objective, best_obj);
+    };
+
     // Root cut loop (#19 Rung-2): generate Gomory MI cuts at the root LP
     // optimum, add them as rows, re-solve warm — repeat while the bound
     // improves. Cut rows are appended to root_lp and every child builds
@@ -148,7 +226,7 @@ Solution solve(const io::Model& model, const Options& opt) {
     io::Model root_lp = model;
     for (int j : ivars) root_lp.integ[j] = 0;
     simplex::WarmStart root_ws;  // last root-round basis (seeds root node)
-    if (std::getenv("IGAOS_NO_CUTS") == nullptr) {
+    if (sub_depth == 0 && std::getenv("IGAOS_NO_CUTS") == nullptr) {
         simplex::WarmStart& ws = root_ws;
         std::vector<simplex::CutRow> cuts;
         const int ROOT_ROUNDS = 8;
@@ -284,7 +362,15 @@ Solution solve(const io::Model& model, const Options& opt) {
         // primary rule per #19 (dive before incumbent, best-bound after),
         // but never abandon live nodes in the other container. Mode switch
         // keys on tree_incumbent, not has_incumbent — see its comment.
+        // Post-incumbent interleave (#21): pure best-bound proofs fast
+        // (p0201 4227 -> 2057 nodes) but stops the DFS that keeps finding
+        // better incumbents on weak-bound models (mas76 40879 -> 43327);
+        // every 4th pop dives instead.
         if (!tree_incumbent) {
+            int i = try_dive();
+            return i >= 0 ? i : try_bound();
+        }
+        if (nodes % 4 == 3) {
             int i = try_dive();
             return i >= 0 ? i : try_bound();
         }
@@ -400,6 +486,21 @@ Solution solve(const io::Model& model, const Options& opt) {
             else          { p.usum += unit; ++p.un; }
         }
 
+        // RINS cadence: fire on any incumbent improvement, else every 200
+        // nodes (improvements matter most right after they land — the
+        // incumbent is fresh and the LP at hand disagrees somewhere useful).
+        // Gap guard: when the incumbent already meets the tree's best open
+        // bound, the answer can't improve — skip (flugpl was 4x slower with
+        // RINS burning 15% of the clock proving nothing)
+        double gbound =
+            by_bound.empty() ? INF : pool[*by_bound.begin()].bound;
+        if (has_incumbent &&
+            best_obj > gbound + 1e-9 * (1.0 + std::fabs(best_obj)) &&
+            (best_obj < rins_last_best - GAP_TOL ||
+             nodes - rins_last_node >= 200)) {
+            run_rins(r.x);
+        }
+
         int frac_var = -1;
         double frac_dist = INT_TOL;
         double best_score = -1.0;
@@ -456,7 +557,13 @@ Solution solve(const io::Model& model, const Options& opt) {
                 // (b) rounding dive — cheap warm LPs off the node basis.
                 // At the root both directions run (nearest first: blend2's
                 // incumbent 8.10 vs 40.1 guided; guided second: ran13x13
-                // 3566 -> 3487); deeper nodes run nearest only
+                // 3566 -> 3487); deeper nodes run nearest only.
+                // Time-boxed (#21): on slow-LP instances (timtab1,
+                // aflow30a) an unboxed root dive burned the entire wall
+                // clock on hundreds of dive LPs without ever finishing.
+                // Budgets: root 35% of clock, deeper nodes 20% while no
+                // incumbent exists (blend2 finds its first incumbent via
+                // long dives at deep tree nodes), 1.5s once one exists.
                 if (child_warm_valid &&
                     elapsed() < opt.time_limit_s - 0.5) {
                   for (int dpass = 0; dpass < (nodes <= 1 ? 2 : 1); ++dpass) {
@@ -465,9 +572,32 @@ Solution solve(const io::Model& model, const Options& opt) {
                     ++dbg_dives;
                     std::vector<double> xd = r.x;
                     simplex::WarmStart ws = child_warm, ws_next;
+                    // DIVE_MAX = all int vars + slack: LP re-solves can make
+                    // previously-integral vars fractional, so the dive may
+                    // need more steps than fractional count; the time budget is the
+                    // real guard against pathological dives
                     const int DIVE_MAX = (int)ivars.size() + 4;
+                    const double dive_t0 = elapsed();
+                    const double dive_budget =
+                        nodes <= 1
+                            ? 0.35 * opt.time_limit_s
+                            : (has_incumbent
+                                   ? 1.5
+                                   : 0.20 * opt.time_limit_s);
                     for (int step = 0; step < DIVE_MAX; ++step) {
                         if (elapsed() > opt.time_limit_s - 0.25) break;
+                        if (elapsed() - dive_t0 > dive_budget) {
+                            // boxed out: still try the rounded current point
+                            // (deeper than the node LP, some vars fixed)
+                            std::vector<double> xr = xd;
+                            for (int j : ivars) {
+                                double v = std::floor(xr[j] + 0.5);
+                                xr[j] = std::min(std::max(v, model.cl[j]),
+                                                model.cu[j]);
+                            }
+                            try_incumbent(xr);
+                            break;
+                        }
                         int fv = -1;
                         double fd = INT_TOL;
                         for (int j : ivars) {
@@ -552,6 +682,17 @@ Solution solve(const io::Model& model, const Options& opt) {
                             }
                             break;
                         }
+                    }
+                    // step-cap exit: still offer the rounded current point
+                    // (same gate as the abort fallback — free to try)
+                    {
+                        std::vector<double> xr = xd;
+                        for (int j : ivars) {
+                            double v = std::floor(xr[j] + 0.5);
+                            xr[j] = std::min(std::max(v, model.cl[j]),
+                                            model.cu[j]);
+                        }
+                        try_incumbent(xr);
                     }
                     if (std::getenv("IGAOS_DEBUG_DIVE") && dbg_dives % 200 == 1)
                         std::fprintf(stderr,
