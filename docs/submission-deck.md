@@ -60,7 +60,7 @@ pybind11 surface.
 
 - Pinned HiGHS v1.15.1 baseline; Netlib + MIPLIB 2017 (v36 solufile)
   protocol; `solved@1e-4 / tight@1e-6` ladder.
-- Robustness suite: 10/15 per-class PASS (degeneracy, ill-conditioning,
+- Robustness suite: 12/15 per-class PASS (degeneracy 4/4, infeasibility 3/3) (degeneracy, ill-conditioning,
   RANGES, free columns, infeasibility).
 - MIPLIB starter subset: **6/20 @1e-4** (flugpl 2.9s, air03 6.0s,
   khb05250 4.2s, p0201 37.7s proven optimal; misc07/acc-tight2 matched)
