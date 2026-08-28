@@ -319,6 +319,7 @@ Solution solve(const io::Model& model, const Options& opt,
     };
 
     EtaFile lu;
+    long iter = 0;  // declared before the lambdas that trace/capture it
     bool basis_dirty = true;  // eta file must be rebuilt from scratch
     vector<double> zb(E.m, 0.0);
     auto build_and_factor = [&]() {
@@ -329,6 +330,18 @@ Solution solve(const io::Model& model, const Options& opt,
                 if (col[r] != 0.0) Bm[(size_t)r * E.m + c] = col[r];
         }
         lu.factor(std::move(Bm));
+        if (getenv("IGAOS_TRACE_PIVOTS")) {
+            double dmin = INF, dmax = 0.0;
+            for (int i = 0; i < E.m; ++i) {
+                double d = std::fabs(lu.base.a[(size_t)i * E.m + i]);
+                dmin = std::min(dmin, d);
+                dmax = std::max(dmax, d);
+            }
+            std::fprintf(stderr, "FACT it=%ld ok=%d dmin=%.3e dmax=%.3e "
+                                 "ratio=%.3e\n",
+                         iter, (int)lu.ok, dmin, dmax,
+                         dmax > 0 ? dmin / dmax : 0.0);
+        }
         basis_dirty = false;  // eta file now matches `basis`
         return lu.ok;
     };
@@ -345,11 +358,14 @@ Solution solve(const io::Model& model, const Options& opt,
     bool inv_logged = false;
 
     std::mt19937 rng(opt.seed ? (unsigned)opt.seed : 20260825u);
-    long iter = 0;
     int degen_streak = 0;
     double expand_tol = 0.0;  // EXPAND ratio-test tolerance (degenerate runs)
     bool bland = false;
     bool perturbed = false;
+    // bound perturbation state (deep-stall anti-degeneracy, see below)
+    vector<double> lo0, up0;
+    bool bounds_perturbed = false;
+    int bound_perturb_count = 0;
     // Columns blocked this basis: their only ratio-test blockers sit below
     // the Harris stability threshold, so pivoting on them is numerically
     // unsafe (observed: singular basis on perold). Skipped in pricing,
@@ -429,6 +445,20 @@ Solution solve(const io::Model& model, const Options& opt,
         vector<int> rec_basis;
         vector<unsigned char> rec_st;
         int rec_enter = -1;
+        bool rolled_back = false;
+        // checkpoint: the basis/st at the last SUCCESSFUL factorization.
+        // When a refactorization fails and single-pivot rollback doesn't
+        // help (the corruption entered >1 pivot ago), restore this — it is
+        // guaranteed to refactor (it did) and z/zb are recomputed from
+        // scratch, clearing any accumulated eta-file desync.
+        vector<int> chk_basis;
+        vector<unsigned char> chk_st;
+        bool chk_valid = false;
+        // entering columns committed since the last verified factorization —
+        // when a checkpoint restore fires, these are blocked: one of them
+        // poisoned the basis, and without blocking them pricing re-attempts
+        // the identical pivot sequence forever (observed on wood1p)
+        vector<int> entered_since_chk;
         for (; iter <= opt.max_iterations; ++iter) {
             {
                 for (long j = 0; j < E.total; ++j) {
@@ -446,12 +476,33 @@ Solution solve(const io::Model& model, const Options& opt,
                     if (!build_and_factor()) {
                         if (rec_enter >= 0) {
                             // the last pivot singularized the basis —
-                            // roll it back and reject that entering column
+                            // roll it back and reject that entering column.
+                            // Block level 2 (persistent): clearing it on the
+                            // next pivot attempt would re-admit the column
+                            // from the SAME restored basis and loop forever
+                            // (observed: alternating singular pivots on
+                            // scsd1 cols 66/88). Cleared only after a
+                            // refactorization-valid pivot changes the basis.
                             basis = rec_basis;
                             st = rec_st;
-                            skip_col[rec_enter] = 1;
+                            skip_col[rec_enter] = 2;
                             rec_enter = -1;
+                            rolled_back = true;
                             basis_dirty = true;  // etas are stale
+                            continue;
+                        }
+                        if (chk_valid) {
+                            // the bad pivot predates the last snapshot:
+                            // fall back to the last verified basis and block
+                            // every column committed since — one of them
+                            // poisoned it
+                            basis = chk_basis;
+                            st = chk_st;
+                            for (int j : entered_since_chk)
+                                if (j >= 0 && j < (int)skip_col.size())
+                                    skip_col[j] = 2;
+                            entered_since_chk.clear();
+                            basis_dirty = true;
                             continue;
                         }
                         sol.status = Status::Error;
@@ -459,8 +510,20 @@ Solution solve(const io::Model& model, const Options& opt,
                         return 5;
                     }
                     basis_dirty = false;
+                    chk_basis = basis;
+                    chk_st = st;
+                    chk_valid = true;
+                    entered_since_chk.clear();
+                    if (rolled_back) {
+                        // this factorization validates the RESTORED basis —
+                        // keep level-2 blocks; the next refactorization that
+                        // follows committed pivots clears them
+                        rolled_back = false;
+                    } else {
+                        for (auto& s : skip_col)
+                            if (s == 2) s = 0;
+                    }
                 }
-                refresh_values();
                 refresh_values();
             }
             if (opt.verbosity > 2) {
@@ -596,7 +659,19 @@ Solution solve(const io::Model& model, const Options& opt,
                     continue;
                 }
             }
-            if (enter0 < 0) return 0;
+            if (enter0 < 0) {
+                // Terminal honesty guard: reduced costs from a long eta
+                // file carry ~1e-6 noise (observed: an exactly-zero dj on a
+                // paired column reading as -1e-6 and manufacturing a false
+                // unbounded ray). Never declare optimality off stale etas —
+                // refactor once and reprice. Terminates: the refactor
+                // empties the eta file, so the second visit passes.
+                if (!lu.etas.empty()) {
+                    basis_dirty = true;
+                    continue;
+                }
+                return 0;
+            }
 
             vector<double> ae;
             E.col_dense(enter0, ae);
@@ -612,6 +687,13 @@ Solution solve(const io::Model& model, const Options& opt,
             double leave_bound = 0.0;
             bool leave_to_upper = false;
             const double ALPHA_FLOOR = 1e-9;
+            // Absolute pivot floor: pivoting on |alpha| below this wrecks
+            // the basis (observed: a 1.9e-8 pivot producing B^{-1} entries
+            // of 1e8 and garbage duals on scsd1). The relative Harris
+            // stability check (1e-7*amax) does not catch these when amax is
+            // itself blown up or when the Bland/accept_unsafe fallbacks
+            // bypass it — every pivot selection path enforces this floor.
+            const double PIVOT_ABS = 1e-7;
             const double DELTA_BASE = 1e-8;
             // EXPAND anti-degeneracy: expand_tol (updated post-pivot) grows
             // each degenerate iteration so zero-distance blockers become
@@ -636,10 +718,12 @@ Solution solve(const io::Model& model, const Options& opt,
                     double ts = dist / std::fabs(rate);
                     if (ts < theta_strict_min) theta_strict_min = ts;
                 }
+                // Harris pass 2: largest |alpha| among candidates within the
+                // relaxed minimum ratio (best pivot).
                 double best_abs = STABILITY;
                 for (int i = 0; i < E.m; ++i) {
                     if (std::fabs(alpha[i]) < best_abs ||
-                        std::fabs(alpha[i]) <= ALPHA_FLOOR)
+                        std::fabs(alpha[i]) <= PIVOT_ABS)
                         continue;
                     double rate = -alpha[i] * dir0;
                     bool to_upper = rate > 0;
@@ -664,7 +748,7 @@ Solution solve(const io::Model& model, const Options& opt,
                 if (bland) {
                     double tmin = INF;
                     for (int i = 0; i < E.m; ++i) {
-                        if (std::fabs(alpha[i]) <= ALPHA_FLOOR) continue;
+                        if (std::fabs(alpha[i]) <= PIVOT_ABS) continue;
                         double rate2 = -alpha[i] * dir0;
                         double dist2 =
                             rate2 > 0 ? (E.up[basis[i]] - zb[i])
@@ -681,7 +765,7 @@ Solution solve(const io::Model& model, const Options& opt,
                         bool bu = false;
                         double bb = 0.0;
                         for (int i = 0; i < E.m; ++i) {
-                            if (std::fabs(alpha[i]) <= ALPHA_FLOOR)
+                            if (std::fabs(alpha[i]) <= PIVOT_ABS)
                                 continue;
                             double rate2 = -alpha[i] * dir0;
                             double dist2 =
@@ -712,9 +796,9 @@ Solution solve(const io::Model& model, const Options& opt,
                 // column is rejected and pricing moves on.
                 if (leave_pos < 0 && std::isfinite(theta_rel) &&
                     accept_unsafe) {
-                    double fb_abs = ALPHA_FLOOR;
+                    double fb_abs = PIVOT_ABS;
                     for (int i = 0; i < E.m; ++i) {
-                        if (std::fabs(alpha[i]) <= ALPHA_FLOOR) continue;
+                        if (std::fabs(alpha[i]) <= PIVOT_ABS) continue;
                         double rate = -alpha[i] * dir0;
                         bool to_upper = rate > 0;
                         double dist = to_upper
@@ -774,14 +858,23 @@ Solution solve(const io::Model& model, const Options& opt,
                 }
                 if (!retry_done) {
                     retry_done = true;
+                    // re-examine the column from a FRESH factorization —
+                    // unboundedness must never be declared off stale etas
+                    // (see the terminal honesty guard above)
+                    basis_dirty = true;
                     continue;
                 }
                 if (opt.verbosity > 0) {
+                    double djchk = E.reduced_cost_part(enter0, y);
+                    double ymax = 0.0;
+                    for (double v : y) ymax = std::max(ymax, std::fabs(v));
                     std::fprintf(stderr,
                                  "[RAY] enter=%d kind=%d lo=%.4g up=%.4g "
-                                 "amax=%.3g\n",
+                                 "amax=%.3g dj=%.6g ymax=%.3g etas=%zu "
+                                 "bland=%d\n",
                                  enter0, (int)E.kind[enter0], E.lo[enter0],
-                                 E.up[enter0], amax);
+                                 E.up[enter0], amax, djchk, ymax,
+                                 lu.etas.size(), (int)bland);
                     for (int i = 0; i < E.m; ++i)
                         if (std::fabs(alpha[i]) > 1e-12)
                             std::fprintf(stderr,
@@ -877,9 +970,59 @@ Solution solve(const io::Model& model, const Options& opt,
                         E.cost[j] += r * 1e-5 * mag;
                     }
                 }
+                // deeper stall: primal degeneracy crawl (theta=0 on >99% of
+                // pivots, e.g. forplan/d6cube phase 1). Expand every finite
+                // bound of structural+slack variables by a small random
+                // epsilon: blocking basics sitting exactly on a bound gain a
+                // nonzero distance, so the ratio-test tie structure that
+                // produces zero-progress pivots dissolves. True bounds are
+                // restored after phase 2 and a cleanup pass re-verifies
+                // optimality (bounds do not affect reduced costs, so the
+                // perturbed optimum is eps-optimal for the true problem).
+                // Re-perturbed (fresh randomness off the TRUE bounds) if the
+                // crawl resumes — a second draw escapes a different tie
+                // structure (observed necessary on d6cube).
+                if (degen_streak >= 1000 && bound_perturb_count < 8) {
+                    if (!bounds_perturbed) {
+                        bounds_perturbed = true;
+                        lo0 = E.lo;
+                        up0 = E.up;
+                    } else {
+                        E.lo = lo0;
+                        E.up = up0;
+                    }
+                    ++bound_perturb_count;
+                    if (opt.verbosity > 0)
+                        std::fprintf(stderr,
+                                     "[simplex] bound perturbation #%d "
+                                     "applied it=%ld ph1=%d\n",
+                                     bound_perturb_count, iter, (int)phase1);
+                    for (long j = 0; j < E.total; ++j) {
+                        if (E.kind[j] == KIND_ART) continue;
+                        bool fin_lo = std::isfinite(E.lo[j]);
+                        bool fin_up = std::isfinite(E.up[j]);
+                        if (fin_lo && fin_up &&
+                            E.up[j] - E.lo[j] <= 1e-12)
+                            continue;  // fixed vars stay fixed
+                        if (fin_lo) {
+                            double r = (double)rng() / (double)rng.max();
+                            E.lo[j] -= (1e-8 + 9e-8 * r) *
+                                       (1.0 + std::fabs(E.lo[j]));
+                        }
+                        if (fin_up) {
+                            double r = (double)rng() / (double)rng.max();
+                            E.up[j] += (1e-8 + 9e-8 * r) *
+                                       (1.0 + std::fabs(E.up[j]));
+                        }
+                    }
+                    degen_streak = 0;
+                }
             }
-            if (!skip_col.empty()) std::fill(skip_col.begin(),
-                                             skip_col.end(), 0);
+            // stability-skips (level 1) are retried on every new pivot;
+            // rollback-blocks (level 2) persist until a verified basis
+            // change (see the factorization block above)
+            for (auto& s : skip_col)
+                if (s == 1) s = 0;
             accept_unsafe = false;
 
             if (flip) {
@@ -898,9 +1041,22 @@ Solution solve(const io::Model& model, const Options& opt,
             st[leaving] = leave_to_upper ? AT_UPPER : AT_LOWER;
             basis[leave_pos] = enter0;
             st[enter0] = BASIC;
+            entered_since_chk.push_back(enter0);
             zb[leave_pos] = z[enter0];
             // product-form update: B_new = B_old · E(leave_pos, alpha)
             lu.update(leave_pos, alpha);
+            if (getenv("IGAOS_TRACE_PIVOTS"))
+                std::fprintf(stderr,
+                             "PIV it=%ld ph1=%d enter=%d leave=%ld@%d "
+                             "theta=%.3e ap=%.3e amax=%.3e\n",
+                             iter, (int)phase1, enter0, leaving, leave_pos,
+                             theta, std::fabs(alpha[leave_pos]),
+                             [&] {
+                                 double a = 0.0;
+                                 for (double v : alpha)
+                                     a = std::max(a, std::fabs(v));
+                                 return a;
+                             }());
             verify_pivot_invariant("pivot", enter0, leave_pos, leaving,
                                    theta, dir0);
 
@@ -1243,6 +1399,27 @@ Solution solve(const io::Model& model, const Options& opt,
             perturbed = false;
             int rc3 = run_simplex(false);
             if (rc3 != 0) {
+                sol.iterations = iter;
+                sol.solve_time_ms = elapsed() * 1000.0;
+                return sol;
+            }
+        }
+        if (bounds_perturbed) {
+            // cleanup pass: restore true bounds. The perturbed optimum is
+            // dual-feasible with true costs (reduced costs are
+            // bounds-independent) but eps-primal-infeasible — exactly the
+            // starting state the bounded-variable DUAL simplex repairs.
+            E.lo = lo0;
+            E.up = up0;
+            bounds_perturbed = false;
+            basis_dirty = true;
+            int rc4 = run_dual_simplex();
+            // rc4==1 ("dual unbounded") after a bound restore is NOT a
+            // trustworthy infeasibility certificate (eps-scale violations,
+            // numerics): fall through and let the final original-model
+            // violation check decide honestly. Other failures (time/iter/
+            // factorization) return as-is.
+            if (rc4 != 0 && rc4 != 1) {
                 sol.iterations = iter;
                 sol.solve_time_ms = elapsed() * 1000.0;
                 return sol;

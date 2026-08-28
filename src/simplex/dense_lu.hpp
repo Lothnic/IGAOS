@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <cmath>
 #include <vector>
 
@@ -18,6 +19,25 @@ struct DenseLU {
         a = std::move(m_in);
         perm.resize(n);
         ok = true;
+        // Near-singularity floor: a basis whose LU pivot falls below
+        // 1e-8 x (median column magnitude) is numerically singular — solves
+        // against it amplify round-off by ~1/floor into the duals (observed:
+        // reduced costs of 1e18 driving an eternal pivot cycle on scsd1).
+        // The MEDIAN column max (not the global max) calibrates the floor:
+        // a single wildly-scaled basis column (wood1p carries entries of
+        // 5e5) must not inflate the floor and reject usable bases. Rejecting
+        // here lets the caller roll back the offending pivot instead of
+        // pivoting on noise forever.
+        constexpr double PIVOT_FLOOR = 1e-8;
+        std::vector<double> colmax(n, 0.0);
+        for (int c = 0; c < n; ++c)
+            for (int r = 0; r < n; ++r)
+                colmax[c] = std::max(colmax[c],
+                                     std::fabs(a[(size_t)r * n + c]));
+        auto mid = colmax.begin() + n / 2;
+        std::nth_element(colmax.begin(), mid, colmax.end());
+        double med = n > 0 ? *mid : 0.0;
+        const double pivot_floor = PIVOT_FLOOR * med;
         for (int i = 0; i < n; ++i) perm[i] = i;
         for (int k = 0; k < n; ++k) {
             int piv = k;
@@ -29,7 +49,7 @@ struct DenseLU {
                     piv = i;
                 }
             }
-            if (!(best > 0.0)) {
+            if (!(best > pivot_floor)) {
                 ok = false;
                 return;
             }
