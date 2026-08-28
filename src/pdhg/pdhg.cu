@@ -272,6 +272,9 @@ Solution solve(const io::Model& lp, const Options& opt) {
     CK(cudaMalloc(&d_ata, n * sizeof(double)));
     CK(cudaMalloc(&d_tm, m * sizeof(double)));
     CK(cudaMalloc(&d_tmpn, n * sizeof(double)));
+    double *d_xb, *d_yb;  // incumbent snapshot
+    CK(cudaMalloc(&d_xb, n * sizeof(double)));
+    CK(cudaMalloc(&d_yb, m * sizeof(double)));
     CK(cudaMemset(d_x, 0, n * sizeof(double)));
     CK(cudaMemset(d_y, 0, m * sizeof(double)));
     CK(cudaMemset(d_xavg, 0, n * sizeof(double)));
@@ -329,8 +332,10 @@ Solution solve(const io::Model& lp, const Options& opt) {
     }
     double ts_max = 1.2 / lam2, ts = 1.2 * ts_max;
     double tau = std::sqrt(ts), sigma = tau;
+    const double prod0 = tau * sigma;  // step product stays pinned
+    const double rt0 = std::sqrt(prod0);
 
-    const int CHECK = 25;
+    const int CHECK = 50;
     // Under an explicit wall-clock budget the time limit governs; the 500k
     // default iteration cap would otherwise cut runs short with time left
     // (share2b was still improving at k=500k inside its 16s budget).
@@ -387,6 +392,15 @@ Solution solve(const io::Model& lp, const Options& opt) {
 
     Metrics last{};
     bool last_is_avg = false;
+    Metrics inc{};
+    bool have_inc = false;
+    double inc_op = 0.0;
+    long last_rollback = 0;
+    double prev_pinf = std::numeric_limits<double>::infinity();
+    double prev_win_op = 0.0;
+    double boom_cap = std::numeric_limits<double>::infinity();
+    std::vector<double> yprev(m, 0.0), xprev(n, 0.0);
+    bool have_prev = false;
     long k = 1;
     for (; k <= MAXIT; ++k) {
         iters_run = k;
@@ -415,6 +429,24 @@ Solution solve(const io::Model& lp, const Options& opt) {
                 std::fprintf(stderr,
                              "[pdhg] k=%ld pinf=%.3e dinf=%.3e gap=%.3e\n",
                              k, last.pinf, last.dinf, last.gap);
+            if (opt.verbosity > 1 && k % 1000 == 0) {
+                double dy = 0.0, dx = 0.0;
+                if (have_prev) {
+                    for (int i = 0; i < m; ++i)
+                        dy = std::max(dy, std::fabs(hy[i] - yprev[i]));
+                    for (int j = 0; j < n; ++j)
+                        dx = std::max(dx, std::fabs(hx[j] - xprev[j]));
+                }
+                std::fprintf(stderr,
+                             "[dbg] k=%ld tau=%.3e sig=%.3e dy=%.3e dx=%.3e "
+                             "op=%.6g mc.pinf=%.2e ma.pinf=%.2e mc.dinf=%.2e "
+                             "ma.dinf=%.2e\n",
+                             k, tau, sigma, dy, dx, last.op, mc.pinf, ma.pinf,
+                             mc.dinf, ma.dinf);
+                std::copy(hy.begin(), hy.end(), yprev.begin());
+                std::copy(hx.begin(), hx.end(), xprev.begin());
+                have_prev = true;
+            }
             // Honest termination: residuals AND a certified duality gap,
             // on either the current or the averaged iterate. Residual-only
             // acceptance returns wrong objectives (sc205, adlittle):
@@ -426,22 +458,139 @@ Solution solve(const io::Model& lp, const Options& opt) {
             if (passes(mc)) { last = mc; last_is_avg = false; break; }
             if (passes(ma)) { last = ma; last_is_avg = true; break; }
 
-            // Adaptive step ratio (PDLP-style): every 500 iters (from k=1000)
-            // nudge tau/sigma toward the measured pinf/dinf imbalance, product
-            // tau*sigma pinned, move clamped to a factor of 1.4 and the ratio
-            // banded to [1e-2, 1e2]. Without the band a primal-feasible
-            // trapped iterate (pinf~0) multiplies tau by 0.7 every 500 iters
-            // until it underflows and the primal freezes (kb2 denormal trap).
-            if (k >= 1000 && k % 500 == 0 &&
-                std::isfinite(last.pinf) && last.pinf > 0 &&
+            // Step-size controller. In the march regime the product
+            // tau*sigma only ever shrinks below prod0 (growth re-pins it);
+            // shrinking tau while raising sigma with the product pinned is
+            // the divergent corner — the huge dual step amplifies the xbar
+            // extrapolation oscillation (grow22).
+            //
+            // March regime: the objective is still improving, the gap is
+            // far from certifiable (pinf << dinf), and the iterate is
+            // crawling along a feasible face — the march speed depends
+            // strongly and non-monotonically on tau (grow22: tau~1.7*rt0
+            // marches ~170x faster than rt0, tau~7*rt0 is slow again —
+            // resonance with the box-clipping pattern). Ride the edge:
+            // grow tau while the averaged iterate stays deep-feasible,
+            // back off when it degrades. The gate is objective progress,
+            // not pinf level, so it persists through the current iterate's
+            // ~1e-3 oscillation and exits by itself at convergence. The
+            // old relative-imbalance rule suppressed tau in exactly this
+            // regime and slowed sc205/grow22 >10x.
+            //
+            // Outside the march regime: the proven PDLP-style imbalance
+            // rule, plus an immediate shrink when pinf rises fast.
+            if (k >= 1000 && std::isfinite(last.pinf) && last.pinf > 0 &&
                 std::isfinite(last.dinf) && last.dinf > 0) {
-                double tgt = std::clamp(last.pinf / last.dinf, 0.1, 10.0);
-                double cur = tau / sigma;
-                double nxt = cur * std::clamp(tgt / cur, 0.7, 1.4);
-                nxt = std::clamp(nxt, 0.1, 10.0);
-                double prod = tau * sigma;
-                tau = std::sqrt(prod * nxt);
-                sigma = prod / tau;
+                if (k % 500 == 0) {
+                    // best-objective iterate: monotone through the march,
+                    // unlike the err-selected `last` whose op oscillates and
+                    // spuriously exits march mode mid-run (grow22 k=125k)
+                    double best_op = std::isfinite(mc.op) ? mc.op : ma.op;
+                    if (std::isfinite(ma.op) && ma.op < best_op)
+                        best_op = ma.op;
+                    double op_gain = prev_win_op - best_op;
+                    bool marching = last.pinf < 0.1 * last.dinf &&
+                                    op_gain > 1e-10 *
+                                                   (1.0 + std::fabs(
+                                                              last.op));
+                    if (marching) {
+                        if (ma.pinf > 1e-3) {
+                            // feasibility degrading: pull tau down WITHOUT
+                            // raising sigma (product shrinks = strictly
+                            // safer); a pinned product here would explode
+                            // sigma and the dual amplifies the xbar
+                            // extrapolation into divergence (grow22)
+                            tau = std::max(tau * 0.8, 0.3 * rt0);
+                        } else if (op_gain <
+                                   1e-6 * (1.0 + std::fabs(best_op))) {
+                            // arrival: the march has slowed near its target;
+                            // tighten the orbit (sigma unchanged — see
+                            // above) so the endgame settles instead of
+                            // oscillating (kb2/sc50a certification)
+                            tau = std::max(tau * 0.7, 0.3 * rt0);
+                        } else if (ma.pinf < 1e-4) {
+                            tau = std::min(tau * 1.5, 8.0 * rt0);
+                            sigma = prod0 / tau;
+                        }
+                        // boom clamp: never re-enter the step size that
+                        // blew the state up (grow22 divergence loop);
+                        // relax slowly so the controller can re-probe
+                        tau = std::min(tau, boom_cap);
+                        boom_cap *= 1.02;
+                    } else {
+                        double tgt = std::clamp(last.pinf / last.dinf, 0.1,
+                                                10.0);
+                        double cur = tau / sigma;
+                        double nxt =
+                            cur * std::clamp(tgt / cur, 0.7, 1.4);
+                        nxt = std::clamp(nxt, 0.1, 10.0);
+                        tau = std::sqrt(prod0 * nxt);
+                    }
+                    sigma = prod0 / tau;
+                    // ponytail: last.op (not best_op) — the two variants
+                    // measure slightly different window gains and sc205's
+                    // chaotic endgame is sensitive to which one gates
+                    // march mode; this one is the measured-good choice
+                    prev_win_op = last.op;
+                }
+                if (ma.pinf >= 1e-2 &&
+                    std::isfinite(prev_pinf) && ma.pinf > 4.0 * prev_pinf) {
+                    tau = std::max(tau * 0.5, 0.3 * rt0);
+                    sigma = prod0 / tau;
+                }
+                prev_pinf = ma.pinf;
+            }
+
+            // Incumbent: best (lowest) objective among deep-feasible
+            // iterates, current or averaged. Feasible points cannot beat
+            // the true optimum, so this is an honest bound to report on
+            // time-limit. Also the rollback anchor when the state blows up.
+            const double* inc_x_src = nullptr;
+            const double* inc_y_src = nullptr;
+            for (int c = 0; c < 2; ++c) {
+                const Metrics& t = c ? ma : mc;
+                // 1e-4: tight enough that infeasibility cannot buy more than
+                // ~1e-4-ish of "superoptimal" objective, loose enough to
+                // catch the feasible dips the endgame oscillation produces.
+                if (t.pinf <= 1e-4 && std::isfinite(t.op) &&
+                    (!have_inc || t.op < inc_op)) {
+                    have_inc = true;
+                    inc_op = t.op;
+                    inc = t;
+                    inc_x_src = c ? d_xavg : d_x;
+                    inc_y_src = c ? d_yavg : d_y;
+                }
+            }
+            if (inc_x_src) {
+                CK(cudaMemcpy(d_xb, inc_x_src, n * sizeof(double),
+                              cudaMemcpyDeviceToDevice));
+                CK(cudaMemcpy(d_yb, inc_y_src, m * sizeof(double),
+                              cudaMemcpyDeviceToDevice));
+            }
+            // Self-heal: a catastrophically blown-up state (pinf >= 0.5)
+            // never recovers the march regime within the budget — restore
+            // the incumbent and re-anchor averaging there with safer steps,
+            // and clamp tau to half the size that blew up so the restored
+            // state does not instantly re-diverge (grow22 divergence loop).
+            // Milder excursions are left alone: the shrunk tau lets them
+            // re-settle on their own and they keep their objective gains.
+            if (mc.pinf >= 0.5 && have_inc && k - last_rollback > 2000) {
+                CK(cudaMemcpy(d_x, d_xb, n * sizeof(double),
+                              cudaMemcpyDeviceToDevice));
+                CK(cudaMemcpy(d_y, d_yb, m * sizeof(double),
+                              cudaMemcpyDeviceToDevice));
+                CK(cudaMemcpy(d_xavg, d_xb, n * sizeof(double),
+                              cudaMemcpyDeviceToDevice));
+                CK(cudaMemcpy(d_yavg, d_yb, m * sizeof(double),
+                              cudaMemcpyDeviceToDevice));
+                boom_cap = std::min(boom_cap, 0.5 * tau);
+                tau = 0.3 * rt0;  // balanced-small: the original stable corner
+                sigma = prod0 / tau;
+                hn = 0;
+                since_restart = 0;
+                last_rollback = k;
+                if (opt.verbosity > 1)
+                    std::fprintf(stderr, "[pdhg] rollback @k=%ld to inc\n", k);
             }
             double r_now = std::isfinite(ma.err()) ? ma.err()
                                                    : INF_NAN;
@@ -495,6 +644,19 @@ Solution solve(const io::Model& lp, const Options& opt) {
 
     const double* fx = last_is_avg ? d_xavg : d_x;
     const double* fy = last_is_avg ? d_yavg : d_y;
+    // Uncertified end-of-run: report the incumbent if its feasible
+    // objective beats the last iterate, or if the last iterate is not even
+    // feasible at tolerance (e.g. a diverged tail — grow22). Honest — the
+    // incumbent's own residuals/gap are reported alongside, status stays
+    // time-limit.
+    if (!certified(last) && have_inc && inc.pinf <= TOL &&
+        std::isfinite(inc.op) &&
+        (inc.op < last.op || last.pinf > TOL)) {
+        last = inc;
+        last_is_avg = false;
+        fx = d_xb;
+        fy = d_yb;
+    }
     sol.objective = last.op + lp.obj_const;
     sol.pinf = last.pinf;
     sol.dinf = last.dinf;
@@ -512,6 +674,7 @@ Solution solve(const io::Model& lp, const Options& opt) {
 
     cudaFree(d_x); cudaFree(d_xnew); cudaFree(d_xbar); cudaFree(d_xavg);
     cudaFree(d_y); cudaFree(d_ynew); cudaFree(d_yavg);
+    cudaFree(d_xb); cudaFree(d_yb);
     cudaFree(d_ata); cudaFree(d_tm); cudaFree(d_tmpn);
     cudaFree(d_ap); cudaFree(d_ai); cudaFree(d_ax);
     cudaFree(d_cp); cudaFree(d_ci); cudaFree(d_acx);
