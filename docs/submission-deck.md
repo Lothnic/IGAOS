@@ -41,6 +41,7 @@ pybind11 surface.
 | Infeasibility detection | klein1 + refinery **proven** infeasible | `docs/research/robustness_results.csv` |
 | MPS edge cases | RANGES/FR/objective-constant correct (e226 exact) | `src/io/model.hpp` |
 | Python parity | bindings == CLI JSON on 4 cases | `demo/test_bindings.py` |
+| GPU PDHG spike set | **6/8 obj-match ≤1e-3 @16s** (afiro gap-certified to machine precision; failures honest) | `spike/pdhg-spike/` |
 
 ## Slide 6 — Innovation
 
