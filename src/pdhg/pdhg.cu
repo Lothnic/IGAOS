@@ -262,6 +262,7 @@ Solution solve(const io::Model& lp, const Options& opt) {
     const double TOL = opt.tolerance;
     long hn = 0;
     long since_restart = 0;
+    bool adapted = false;
     double epoch_r0 = -1.0;
     int zbad_guard = 0;
     (void)zbad_guard;
@@ -351,6 +352,22 @@ Solution solve(const io::Model& lp, const Options& opt) {
             bool gap_ok = std::isfinite(last.gap) && last.gap <= TOL;
             if (res_ok && (!opt.restarts || gap_ok)) break;
 
+            // adaptive steps (#20): ONE-SHOT residual rebalance at the
+            // 1000-iteration checkpoint (PDLP-style): set the ratio from
+            // the measured pinf/dinf, product pinned to the initial
+            // tau*sigma. Continuous adjustment destabilizes (verified:
+            // iterates collapse to balanced garbage at objective 0).
+            if (k == 1000 && !adapted) {
+                adapted = true;
+                if (std::isfinite(last.pinf) && last.pinf > 0 &&
+                    std::isfinite(last.dinf) && last.dinf > 0) {
+                    double ratio = std::clamp(last.pinf / last.dinf,
+                                              0.1, 10.0);
+                    double prod = tau * sigma;
+                    tau = std::sqrt(prod * ratio);
+                    sigma = prod / tau;
+                }
+            }
             double r_now = std::isfinite(ma.err()) ? ma.err()
                                                    : INF_NAN;
             if (epoch_r0 == INF_NAN) epoch_r0 = r_now;
