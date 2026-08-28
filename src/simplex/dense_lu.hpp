@@ -109,14 +109,23 @@ struct EtaFile {
     int m = 0;
     bool ok = false;
     bool unstable = false;  // an eta pivot was relatively tiny
+    int since_unstable = 0;  // pivots since the unstable flag was raised
 
     static constexpr int REFACTOR_ETA = 50;
+    // Backoff: degenerate problems route pivots through Bland/last-resort
+    // fallbacks whose pivots sit below the stability threshold, and
+    // refactoring on every one stormed (modszk1: 430 O(m^3) factors in 15s
+    // at m=687). Tolerate a few unstable etas before paying for a refactor;
+    // the honesty guards (refactor before declaring optimal or unbounded)
+    // bound the damage of the extra drift.
+    static constexpr int UNSTABLE_BACKOFF = 8;
 
     void factor(std::vector<double> Bm) {
         m = static_cast<int>(std::sqrt((double)Bm.size()));
         piv.clear();
         etas.clear();
         unstable = false;
+        since_unstable = 0;
         base.factor(std::move(Bm));
         ok = base.ok;
     }
@@ -126,16 +135,23 @@ struct EtaFile {
     void update(int p, const std::vector<double>& alpha) {
         piv.push_back(p);
         etas.push_back(alpha);
+        ++since_unstable;
         // small relative pivot elements wreck product-form accuracy —
         // flag for refactorization at the next opportunity
         double amax = 0.0;
         for (double v : alpha) amax = std::max(amax, std::fabs(v));
-        if (std::fabs(alpha[p]) < 1e-2 * amax) unstable = true;
+        // 1e-4 relative: the 1e-2 trigger refactorized on nearly every
+        // pivot of ill-conditioned Netlib rows (perold: 505 FACTs/1670
+        // pivots — the O(m^3) factorization dominated the solve). Etas with
+        // pivot >= 1e-4*amax lose ~4 digits worst-case, which the honesty
+        // guards (refactor-before-declare, PIVOT_ABS floor) already cover.
+        if (std::fabs(alpha[p]) < 1e-4 * amax) unstable = true;
         ok = base.ok;
     }
 
     bool needs_refactor() const {
-        return (int)etas.size() >= REFACTOR_ETA || unstable;
+        return (int)etas.size() >= REFACTOR_ETA ||
+               (unstable && since_unstable >= UNSTABLE_BACKOFF);
     }
 
     // x = B^{-1} v: base solve, then etas in insertion order

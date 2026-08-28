@@ -359,6 +359,7 @@ Solution solve(const io::Model& model, const Options& opt,
 
     std::mt19937 rng(opt.seed ? (unsigned)opt.seed : 20260825u);
     int degen_streak = 0;
+    int crawl_steps = 0;  // cumulative eps-steps since last perturbation
     double expand_tol = 0.0;  // EXPAND ratio-test tolerance (degenerate runs)
     bool bland = false;
     bool perturbed = false;
@@ -945,12 +946,20 @@ Solution solve(const io::Model& model, const Options& opt,
                 }
             }
 
-            if (theta > 1e-9) {
+            // Epsilon-crawl counts as degenerate: an eps-scale step
+            // (theta ~ 1e-7) is zero progress for practical purposes —
+            // d6cube phase 2 takes 100k+ such steps, each resetting the
+            // streak, so the anti-degeneracy machinery never fired. Any
+            // step below 1e-6 of the entering variable's own scale feeds
+            // the streak; only real progress resets it.
+            double eps_step = 1e-6 * (1.0 + std::fabs(z[enter0]));
+            if (theta > eps_step) {
                 degen_streak = 0;
                 bland = false;
                 expand_tol = 0.0;
             } else {
                 ++degen_streak;
+                ++crawl_steps;
                 expand_tol = std::min(expand_tol + DELTA_BASE,
                                       1e-4 * (1.0 + E.cmax_x));
                 if (degen_streak >= 20 && !bland) {
@@ -970,19 +979,24 @@ Solution solve(const io::Model& model, const Options& opt,
                         E.cost[j] += r * 1e-5 * mag;
                     }
                 }
-                // deeper stall: primal degeneracy crawl (theta=0 on >99% of
-                // pivots, e.g. forplan/d6cube phase 1). Expand every finite
-                // bound of structural+slack variables by a small random
-                // epsilon: blocking basics sitting exactly on a bound gain a
-                // nonzero distance, so the ratio-test tie structure that
-                // produces zero-progress pivots dissolves. True bounds are
-                // restored after phase 2 and a cleanup pass re-verifies
-                // optimality (bounds do not affect reduced costs, so the
-                // perturbed optimum is eps-optimal for the true problem).
-                // Re-perturbed (fresh randomness off the TRUE bounds) if the
-                // crawl resumes — a second draw escapes a different tie
-                // structure (observed necessary on d6cube).
-                if (degen_streak >= 1000 && bound_perturb_count < 8) {
+                // deeper stall: primal degeneracy crawl (eps steps on >70%
+                // of pivots, e.g. forplan/d6cube). Expand every finite
+                // bound of structural+slack variables by a random epsilon
+                // ABOVE the crawl scale (crawl steps run ~1e-7; a 1e-7
+                // perturbation dissolves nothing): blocking basics sitting
+                // on a bound gain a nonzero distance, so the ratio-test
+                // tie structure that produces zero-progress pivots
+                // dissolves. True bounds are restored after each phase and
+                // a cleanup pass re-verifies optimality (bounds do not
+                // affect reduced costs, so the perturbed optimum is
+                // eps-optimal for the true problem).
+                // CUMULATIVE crawl counter (not consecutive streak): real
+                // steps interleave the crawl and reset a streak long
+                // before 1000, so the consecutive trigger fired once per
+                // 80k iterations on d6cube. Re-perturbed (fresh randomness
+                // off the TRUE bounds) when the crawl resumes — a new draw
+                // escapes a different tie structure.
+                if (crawl_steps >= 2000 && bound_perturb_count < 16) {
                     if (!bounds_perturbed) {
                         bounds_perturbed = true;
                         lo0 = E.lo;
@@ -1006,16 +1020,17 @@ Solution solve(const io::Model& model, const Options& opt,
                             continue;  // fixed vars stay fixed
                         if (fin_lo) {
                             double r = (double)rng() / (double)rng.max();
-                            E.lo[j] -= (1e-8 + 9e-8 * r) *
+                            E.lo[j] -= (1e-7 + 9e-7 * r) *
                                        (1.0 + std::fabs(E.lo[j]));
                         }
                         if (fin_up) {
                             double r = (double)rng() / (double)rng.max();
-                            E.up[j] += (1e-8 + 9e-8 * r) *
+                            E.up[j] += (1e-7 + 9e-7 * r) *
                                        (1.0 + std::fabs(E.up[j]));
                         }
                     }
                     degen_streak = 0;
+                    crawl_steps = 0;
                 }
             }
             // stability-skips (level 1) are retried on every new pivot;
@@ -1268,6 +1283,26 @@ Solution solve(const io::Model& model, const Options& opt,
         sol.iterations = iter;
         sol.solve_time_ms = elapsed() * 1000.0;
         return sol;
+    }
+    if (bounds_perturbed) {
+        // Phase 1 ran on perturbed bounds: the phase-1 optimum is
+        // eps-infeasible for the TRUE bounds (observed: 2e-6 basic
+        // violation on d6cube failing the strict post-phase check) and
+        // phase 2 would inherit eps-out-of-bounds basics — the ratio test
+        // then sees negative distances clamped to zero, an instant
+        // degenerate crawl. Restore true bounds and clean up with a short
+        // phase-1 re-run from the near-feasible point.
+        E.lo = lo0;
+        E.up = up0;
+        bounds_perturbed = false;
+        bound_perturb_count = 0;
+        basis_dirty = true;
+        int rcb = run_simplex(true);
+        if (rcb != 0) {
+            sol.iterations = iter;
+            sol.solve_time_ms = elapsed() * 1000.0;
+            return sol;
+        }
     }
     snap_and_resolve();
     {

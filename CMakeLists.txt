@@ -5,6 +5,14 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# Default to Release: an unoptimized build (empty CMAKE_BUILD_TYPE) left the
+# dense LU/eta kernels at -O0 — ~9x slower, and the Netlib 30s gate results
+# depended on it silently. No build type was ever set anywhere, so every
+# default configure was running unoptimized.
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+  set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
 include(CheckLanguage)
 check_language(CUDA)
 set(IGAOS_HAVE_PDHG 0)
