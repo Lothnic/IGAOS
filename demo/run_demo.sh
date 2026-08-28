@@ -6,7 +6,11 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-BIN=./build-fin/src/api/igaos
+if [ -x ./build-fin/src/api/igaos ]; then
+    BIN=./build-fin/src/api/igaos
+else
+    BIN=./build/src/api/igaos
+fi
 PY=/usr/bin/python3
 BIG=benchmarks/lpfeas/ex10.mps   # 1.16M-nnz Mittelmann LPfeas instance (gpu_showcase.md)
 SHOWCASE_DOC=docs/research/gpu_showcase.md
@@ -67,13 +71,13 @@ echo "  (min form; literature optimum of the true bilinear NLP: -400 — pooling
 echo "   we present it honestly at the levels our engines actually solve)"
 echo ""
 echo "2b · infeasibility proof — Netlib lp/infeas/refinery.mps (doctored petrochemical plant)"
-$BIN solve benchmarks/benchmarks/netlib/infeas/refinery.mps --engine simplex --time-limit 20 | \
+$BIN solve benchmarks/netlib/infeas/refinery.mps --engine simplex --time-limit 20 | \
     $PY -c "import json,sys; d=json.load(sys.stdin); print(f\"status: {d['status']}  ({d['message']})\")"
 echo "TAKEAWAY: three honesty levels on one pooling family, plus a certified infeasible verdict."
 
 # ---------------------------------------------------------------------------
 banner "3 · Real MILP — MIPLIB 2017 khb05250, branch-and-bound to proven optimality"
-$BIN solve benchmarks/benchmarks/miplib2017/khb05250.mps --engine milp --time-limit 60 | \
+$BIN solve benchmarks/miplib2017/khb05250.mps --engine milp --time-limit 60 | \
     $PY -c "import json,sys; d=json.load(sys.stdin); print(f\"status: {d['status']}  obj {d['objective']:.0f}  ({d['message']}, {d['solve_time_ms']/1000:.1f} s)\")"
 echo "TAKEAWAY: integer optima with a proof certificate, not just a heuristic answer."
 
