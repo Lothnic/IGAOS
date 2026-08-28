@@ -7,12 +7,13 @@
    quadratic penalty can only worsen profit) — Haverly honesty ladder.
 """
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-BIN = ROOT / "build/src/api/igaos"
+BIN = Path(os.environ.get("IGAOS_BIN", ROOT / "build/src/api/igaos"))
 
 CASES = [
     # (l1 model, l0 model, HiGHS reference)
