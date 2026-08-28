@@ -1532,30 +1532,50 @@ Solution solve(const io::Model& model, const Options& opt,
         true_integ != nullptr ? *true_integ : model.integ;
     if (cuts_out != nullptr && sol.status == Status::Optimal) {
         // Gomory mixed-integer cuts from fractional basic integer
-        // variables. Only PURE-STRUCTURAL tableau rows are emitted (rows
-        // touching slacks/arts are skipped — translating slack
-        // coefficients back to model rows is future work). Scaling is
-        // power-of-two so unscaling is exact.
+        // variables. Tableau rows fold nonbasic slacks (s_i = A_i x)
+        // back into structural space; nonbasic artificials are fixed at
+        // 0 and skipped. Scaling is power-of-two so unscaling is exact.
         const int MAX_CUTS = 20;
+        // instrumentation: why rows are rejected (IGAOS_DEBUG_CUTS)
+        long dbg_rows = 0, dbg_nonstruct = 0, dbg_nonint = 0,
+             dbg_f0 = 0, dbg_art = 0, dbg_empty = 0, dbg_dyn = 0,
+             dbg_dense = 0, dbg_emit = 0, dbg_artcols = 0;
+        for (int i = 0; i < E.m; ++i)
+            if (E.kind[basis[i]] == KIND_ART) ++dbg_artcols;
         vector<double> rho(E.m), unit(E.m);
         for (int r = 0; r < E.m && (int)cuts_out->size() < MAX_CUTS; ++r) {
+            ++dbg_rows;
             long k = basis[r];
-            if (k < 0 || k >= E.nx) continue;               // structural
-            if (!cut_integ[k]) continue;                     // integer
+            if (k < 0 || k >= E.nx) { ++dbg_nonstruct; continue; }
+            if (!cut_integ[k]) { ++dbg_nonint; continue; }
             double beta = zb[r] * E.sc.col[k];              // original value
             double f0 = beta - std::floor(beta);
-            if (f0 < 0.01 || f0 > 0.99) continue;
+            if (f0 < 0.01 || f0 > 0.99) { ++dbg_f0; continue; }
             std::fill(unit.begin(), unit.end(), 0.0);
             unit[r] = 1.0;
             lu.solve_transpose(unit, rho);
             // tableau row over nonbasic structurals and slacks (slack i is
             // the row activity s_i = A_i x, so its coefficient folds into
-            // structural space); art coefficients disqualify the row
+            // structural space). Nonbasic ARTIFICIALS are SKIPPED, not
+            // disqualifying: after the drive-out every art is fixed at
+            // [0,0] with value 0, so its tableau coefficient multiplies a
+            // constant 0 — it contributes nothing to the cut and any
+            // integer-feasible point of the original model extends to the
+            // augmented system with arts at 0, so dropping the term is
+            // exact. (This was the silent-generator bug: rows whose
+            // B^-1 e_r touched an art row were all rejected.)
             bool usable = true;
             vector<std::pair<int, double>> row_terms;  // (j, a_j^orig)
             vector<std::pair<int, double>> slack_terms;  // (row i, a^orig)
             for (long j = 0; j < E.total && usable; ++j) {
                 if (st[j] == BASIC) continue;
+                if (E.kind[j] == KIND_ART) {
+                    // sanity: art must be fixed at 0 to be droppable
+                    if (!(E.lo[j] == 0.0 && E.up[j] == 0.0 &&
+                          z[j] == 0.0))
+                        usable = false;
+                    continue;
+                }
                 double aj = 0.0;
                 switch (E.kind[j]) {
                     case KIND_X:
@@ -1566,13 +1586,13 @@ Solution solve(const io::Model& model, const Options& opt,
                         aj = -rho[j - E.nx];
                         break;
                     case KIND_ART:
-                        aj = rho[E.art_row[j - E.nx - E.m]] *
-                             E.art_sigma[j - E.nx - E.m];
                         break;
                 }
                 if (std::fabs(aj) <= 1e-9) continue;
-                if (E.kind[j] == KIND_ART) {
-                    usable = false;  // arts have no model-space meaning
+                if (st[j] == FREE_NB) {
+                    // a free nonbasic is unconstrained in u-space — a
+                    // nonzero coefficient would make the cut invalid
+                    usable = false;
                     continue;
                 }
                 double sigma = (st[j] == AT_UPPER) ? -1.0 : 1.0;
@@ -1582,41 +1602,86 @@ Solution solve(const io::Model& model, const Options& opt,
                     row_terms.emplace_back((int)j, a_orig);
                 } else {
                     int i = (int)(j - E.nx);
+                    // scaled slack value = sc.row[i] * (A_i x), so the
+                    // original-space tableau coefficient is
+                    // alpha * sc.row[i] * sc.col[k] (was divided by
+                    // sc.row[i] — silently invalid cuts on rows whose
+                    // power-of-two row scale != 1)
                     double a_orig =
-                        aj * sigma * E.sc.col[k] / E.sc.row[i];
+                        aj * sigma * E.sc.col[k] * E.sc.row[i];
                     slack_terms.emplace_back(i, a_orig);
                 }
             }
-            if (!usable || (row_terms.empty() && slack_terms.empty()))
+            if (!usable || (row_terms.empty() && slack_terms.empty())) {
+                if (!usable) ++dbg_art;  // unfixed art (should never fire)
+                else ++dbg_empty;
                 continue;
+            }
+            if (const char* dp = getenv("IGAOS_DUMP_CUTS")) {
+                // raw tableau row for offline identity checks:
+                // x_k(x) = beta - sum a_j sigma_j (x_j - x_j^cur)
+                //          - sum a_si sigma_i (s_i(x) - s_i^cur)
+                FILE* f = fopen(dp, "a");
+                if (f) {
+                    std::fprintf(f, "ROW k=%ld beta=%.17g f0=%.17g "
+                                        "xk=%.17g\n",
+                                 k, zb[r] * E.sc.col[k], f0, sol.x[k]);
+                    for (auto& [j, a] : row_terms)
+                        std::fprintf(f, "T %d %.17g %.17g %d\n", j, a,
+                                     z[j] * E.sc.col[j], (int)st[j]);
+                    for (auto& [i, a] : slack_terms) {
+                        double act = 0.0;
+                        for (int p = work.ap[i]; p < work.ap[i + 1]; ++p)
+                            act += work.ax[p] * sol.x[work.ai[p]];
+                        std::fprintf(f, "S %d %.17g %.17g %d\n", i, a, act,
+                                     (int)st[E.nx + i]);
+                    }
+                    fclose(f);
+                }
+            }
             // GMI coefficients over structurals (integer formula) and
             // slacks (continuous formula). Cut: sum pi_j u_j >= f0 with
             // u_j = sigma_j (x_j - x_j^cur) >= 0; slacks substitute
-            // s_i = A_i x into structural space.
+            // s_i = A_i x into structural space. The stored tableau
+            // coefficient a IS the u-space coefficient (alpha_j *
+            // sigma_j, sigma folded at row-build time) — the formula is
+            // applied to it directly and the x-space coefficient is
+            // pi * sigma_j. The integer formula is only valid when u_j
+            // is integer, i.e. the nonbasic integer sits at an INTEGRAL
+            // value; at a fractional bound it must use the continuous
+            // formula.
+            //
+            // Continuous coefficients (row convention x_k = beta -
+            // sum a_j u_j): pi = a for a > 0, |a|*f0/(1-f0) for a < 0.
+            // The previous form (a*f0/(1-f0) / |a|*(1-f0)/f0) is
+            // INVALID for f0 > 0.5 with negative coefficients — it cut
+            // off the true optimum on flugpl; brute-force validated on
+            // random rows (see /tmp harness in the commit message).
             CutRow cut;
             double lhs = f0;
             std::map<int, double> coef;  // column -> accumulated coefficient
             for (auto& [j, a] : row_terms) {
                 double sigma = (st[j] == AT_UPPER) ? -1.0 : 1.0;
+                double z_orig = z[j] * E.sc.col[j];
+                bool int_form =
+                    cut_integ[j] &&
+                    std::fabs(z_orig - std::floor(z_orig + 0.5)) < 1e-6;
                 double pi;
-                if (cut_integ[j]) {
+                if (int_form) {
                     double fj = a - std::floor(a);
                     pi = (fj <= f0) ? fj : f0 * (1.0 - fj) / (1.0 - f0);
                 } else {
-                    pi = (a > 0) ? a * f0 / (1.0 - f0)
-                                 : -a * (1.0 - f0) / f0;
+                    pi = (a > 0) ? a : -a * f0 / (1.0 - f0);
                 }
                 if (std::fabs(pi) < 1e-9) continue;
                 coef[j] += pi * sigma;
-                double z_orig = z[j] * E.sc.col[j];
                 lhs += pi * sigma * z_orig;
             }
             for (auto& [i, a] : slack_terms) {
                 // slack i is continuous with original value = row activity
                 long sv = E.nx + i;
                 double sigma = (st[sv] == AT_UPPER) ? -1.0 : 1.0;
-                double pi = (a > 0) ? a * f0 / (1.0 - f0)
-                                    : -a * (1.0 - f0) / f0;
+                double pi = (a > 0) ? a : -a * f0 / (1.0 - f0);
                 if (std::fabs(pi) < 1e-9) continue;
                 double act = 0.0;
                 for (int p = work.ap[i]; p < work.ap[i + 1]; ++p) {
@@ -1629,14 +1694,38 @@ Solution solve(const io::Model& model, const Options& opt,
             for (auto& [j, c] : coef)
                 if (std::fabs(c) > 1e-9) cut.coeffs.emplace_back(j, c);
             cut.lhs = lhs;
-            cut.lhs = lhs;
             // dynamism guard: reject wild cuts
             double amax = 0.0;
             for (auto& [j, c] : cut.coeffs)
                 amax = std::max(amax, std::fabs(c));
-            if (amax > 1e6 || cut.coeffs.empty()) continue;
+            if (amax > 1e6 || cut.coeffs.empty()) { ++dbg_dyn; continue; }
+            // density cap: a dense GMI row (common on set-covering models
+            // where every tableau alpha is O(1)) multiplies the LP's nnz
+            // and every BTRAN/FTRAN crawls — measured on mod010: 100
+            // fully-dense rows made node LPs ~35x slower than the bound
+            // closure was worth. Sparse cuts only.
+            if ((int)cut.coeffs.size() > 100) { ++dbg_dense; continue; }
+            ++dbg_emit;
+            if (const char* dp = getenv("IGAOS_DUMP_CUTS")) {
+                FILE* f = fopen(dp, "a");
+                if (f) {
+                    std::fprintf(f, "CUT nnz=%zu lhs=%.17g\n",
+                                 cut.coeffs.size(), cut.lhs);
+                    for (auto& [j, c] : cut.coeffs)
+                        std::fprintf(f, "%d %.17g\n", j, c);
+                    fclose(f);
+                }
+            }
             cuts_out->push_back(std::move(cut));
         }
+        if (getenv("IGAOS_DEBUG_CUTS"))
+            std::fprintf(stderr,
+                         "[cuts] rows=%ld nonstruct=%ld nonint=%ld f0=%ld "
+                         "art_unfixed=%ld empty=%ld dyn=%ld dense=%ld "
+                         "emitted=%ld arts_basic=%ld\n",
+                         dbg_rows, dbg_nonstruct, dbg_nonint, dbg_f0,
+                         dbg_art, dbg_empty, dbg_dyn, dbg_dense, dbg_emit,
+                         dbg_artcols);
     }
     if (warm_out != nullptr && sol.status == Status::Optimal) {
         // snapshot: structural+slack basis slots (arts recorded as -1 —

@@ -43,7 +43,7 @@ Solution solve(const io::Model& model, const Options& opt) {
     // weak-bound instances (gt2/ran13x13). Only a tree-proven incumbent
     // (integral leaf) switches to best-bound for the proof.
     bool tree_incumbent = false;
-    long nodes = 0, solves = 0, lp_failures = 0;
+    long nodes = 0, solves = 0, lp_failures = 0, lp_infeasible = 0;
 
     // best-bound + dive (#19): before any incumbent exists we dive
     // (deepest node) to reach integer feasibility fast; afterwards the
@@ -147,19 +147,31 @@ Solution solve(const io::Model& model, const Options& opt) {
     // on root_lp (bounds-only deltas), so cuts propagate tree-wide.
     io::Model root_lp = model;
     for (int j : ivars) root_lp.integ[j] = 0;
-    {
-        simplex::WarmStart ws;
+    simplex::WarmStart root_ws;  // last root-round basis (seeds root node)
+    if (std::getenv("IGAOS_NO_CUTS") == nullptr) {
+        simplex::WarmStart& ws = root_ws;
         std::vector<simplex::CutRow> cuts;
         const int ROOT_ROUNDS = 8;
-        double prev_bound = INF;
+        double prev_bound = -INF;  // min: bound must INCREASE to continue
         double bound0 = INF;  // pre-cut root bound (cut-worthiness gate)
         for (int round = 0; round < ROOT_ROUNDS; ++round) {
+            // root-cut budget: rounds after the mandatory root LP get at
+            // most a quarter of the wall clock, and no round may outrun
+            // the global budget (each simplex::solve runs its own clock)
+            if (round > 0 && elapsed() > 0.25 * opt.time_limit_s) break;
             simplex::WarmStart ws_next;
-            Solution r = simplex::solve(root_lp, opt,
+            Options ropt = opt;
+            ropt.time_limit_s =
+                std::max(1.0, opt.time_limit_s - elapsed());
+            Solution r = simplex::solve(root_lp, ropt,
                                         ws.basis.empty() ? nullptr : &ws,
                                         &ws_next, &cuts, &model.integ);
-            if (r.status != Status::Optimal) break;
-            ws = ws_next;
+            if (r.status != Status::Optimal) {
+                if (std::getenv("IGAOS_DEBUG_CUTS"))
+                    std::fprintf(stderr, "[cuts] round=%d status=%d msg=%s\n",
+                                 round, (int)r.status, r.message.c_str());
+                break;
+            }
             if (std::getenv("IGAOS_DEBUG_CUTS")) {
                 std::fprintf(stderr, "[cuts] round=%d bound=%.6f cuts=%zu\n",
                              round, r.objective, cuts.size());
@@ -174,11 +186,14 @@ Solution solve(const io::Model& model, const Options& opt) {
                 }
             }
             if (round == 0) bound0 = r.objective;
-            if (r.objective >= prev_bound - 1e-9 || cuts.empty()) break;
+            // minimization: a bound INCREASE is the improvement — the
+            // loop continues only while the cuts keep lifting the bound
+            if (r.objective <= prev_bound + 1e-9 || cuts.empty()) break;
             prev_bound = r.objective;
             // append cut rows AND materialize them into the matrix —
             // the next round solves the augmented model, so the rebuild
             // must happen inside the loop
+            int oldm = root_lp.m;
             std::vector<std::tuple<int, int, double>> all;
             for (int j = 0; j < root_lp.n; ++j)
                 for (int p = root_lp.cp[j]; p < root_lp.cp[j + 1]; ++p)
@@ -194,22 +209,56 @@ Solution solve(const io::Model& model, const Options& opt) {
                               root_lp.ai, root_lp.ax, root_lp.cp,
                               root_lp.ci, root_lp.acx);
             cuts.clear();
+            // cut-row budget: cut rows at most double the model — on
+            // small LPs (flugpl m=18) unbounded rounds piled 76 extra
+            // rows on an 18-row LP and the tree drowned
+            if (root_lp.m > 2 * model.m) break;
+            // SOUND warm start across the appended rows: extend the
+            // snapshot with the new rows' slack variables basic in their
+            // own slots. The augmented basis matrix is block triangular
+            // (old B + -I), the old optimum's reduced costs are
+            // unchanged (cut slacks cost 0), so the restored basis is
+            // DUAL feasible and primal infeasible exactly where the cuts
+            // bite — the dual simplex repairs it through the standard
+            // validated warm path (factor check, final orig-model guard).
+            if (ws_next.basis.size() == (size_t)oldm) {
+                for (int i = oldm; i < root_lp.m; ++i) {
+                    ws_next.basis.push_back(root_lp.n + i);
+                    ws_next.nb_state.push_back(2);  // engine BASIC
+                }
+                ws = std::move(ws_next);
+            } else {
+                ws = simplex::WarmStart();  // malformed: cold next round
+            }
         }
         // cut-worthiness gate: keep cuts only when they closed the root
-        // bound by >= 1% — otherwise the larger child LPs cost more than
-        // the closure buys (observed: knap25 247 -> 475 nodes with thin
-        // cuts). ponytail: 1% heuristic; per-instance cut selection (cut
-        // aging, orthogonality filters) if the bar demands it
+        // bound by >= 5% — otherwise the larger child LPs and the changed
+        // branching trajectory cost more than the closure buys.
+        // Measured on the MIPLIB slice: flugpl (0.8% closure, was PROVEN
+        // optimal without cuts, finds no incumbent with them) and
+        // ran13x13 (2.3%, slightly worse incumbent) must be dropped;
+        // gt2 (53% closure, incumbent 77383 -> 32084) is the profile
+        // cuts are for. ponytail: heuristic; per-instance cut selection
+        // (aging, orthogonality) if the bar demands it
         bool cuts_worthwhile =
             std::isfinite(bound0) && std::isfinite(prev_bound) &&
-            prev_bound > bound0 + 0.01 * (1.0 + std::fabs(bound0));
+            prev_bound > bound0 + 0.05 * (1.0 + std::fabs(bound0));
         if (!cuts_worthwhile && root_lp.m > model.m) {
             root_lp = model;               // drop the cut rows entirely
             for (int j : ivars) root_lp.integ[j] = 0;
         }
-        root.cl = root_lp.cl;
-        root.cu = root_lp.cu;
     }
+    // root was moved-from by the first push_node — refill its bounds
+    // (identical to model's unless worthwhile cuts are in root_lp)
+    root.cl = root_lp.cl;
+    root.cu = root_lp.cu;
+    // seed the root node with the last round's basis when it matches the
+    // final matrix (mismatch = cuts were dropped / rounds stopped early —
+    // sizes fail the warm check and the node cold-solves)
+    root.warm = std::move(root_ws);
+    root.warm_valid =
+        (int)root.warm.basis.size() == root_lp.m &&
+        (int)root.warm.nb_state.size() == root_lp.n + root_lp.m;
     pool.clear();
     dive.clear();
     by_bound.clear();
@@ -273,6 +322,7 @@ Solution solve(const io::Model& model, const Options& opt) {
         simplex::WarmStart child_warm;
         bool warm_here = nd.warm_valid &&
                          std::getenv("IGAOS_NO_WARM") == nullptr;
+        double t_node0 = elapsed();
         Solution r = simplex::solve(lp, opt, warm_here ? &nd.warm : nullptr,
                                     &child_warm);
         if (warm_here && (r.status == Status::Error ||
@@ -284,11 +334,55 @@ Solution solve(const io::Model& model, const Options& opt) {
             // cold solve; warm still pays off on the nodes it completes.
             r = simplex::solve(lp, opt, nullptr, &child_warm);
         }
+        if (std::getenv("IGAOS_DEBUG_NODES")) {
+            double mv = 0.0;
+            if ((int)r.x.size() == model.n) {
+                for (int i = 0; i < model.m; ++i) {
+                    double lhs = 0.0;
+                    for (int p = model.ap[i]; p < model.ap[i + 1]; ++p)
+                        lhs += model.ax[p] * r.x[model.ai[p]];
+                    mv = std::max(mv, std::max(model.rmin[i] - lhs,
+                                               lhs - model.rmax[i]));
+                }
+            }
+            std::fprintf(stderr, "[node] %ld warm=%d st=%d obj=%.4f %.3fs "
+                                "maxviol=%.3g\n",
+                         nodes, (int)warm_here, (int)r.status, r.objective,
+                         elapsed() - t_node0, mv);
+        }
         bool child_warm_valid =
             r.status == Status::Optimal && !child_warm.basis.empty();
+        // Root verdicts: the root LP is solved cold (the warm fallback
+        // above re-solves cold on Error/Infeasible, so a surviving
+        // Infeasible is a trustworthy phase-1 certificate; cuts in
+        // root_lp are valid, so augmented-infeasible implies the MIP is
+        // infeasible). Unbounded root LP can NOT certify an unbounded
+        // MIP without a feasible integer point — report Error, honestly.
+        if (nd.depth == 0 && nodes == 1) {
+            if (r.status == Status::Infeasible) {
+                sol.status = Status::Infeasible;
+                sol.message = "root LP infeasible";
+                sol.iterations = nodes;
+                sol.solve_time_ms = elapsed() * 1000.0;
+                return sol;
+            }
+            if (r.status == Status::Unbounded) {
+                sol.status = Status::Error;
+                sol.message = "root LP unbounded: MIP is unbounded or "
+                              "infeasible (not certified)";
+                sol.iterations = nodes;
+                sol.solve_time_ms = elapsed() * 1000.0;
+                return sol;
+            }
+        }
         if (r.status != Status::Optimal && r.status != Status::NearOptimal &&
             r.status != Status::Feasible) {
             ++lp_failures;
+            // Infeasible survived the cold fallback above, so it is a
+            // trustworthy phase-1 certificate for this subtree — count it
+            // separately from engine Errors so the final status can tell
+            // an infeasible MIP from a broken engine.
+            if (r.status == Status::Infeasible) ++lp_infeasible;
             continue;
         }
 
@@ -513,10 +607,20 @@ Solution solve(const io::Model& model, const Options& opt) {
         sol.x = best_x;
         sol.message = b;
     } else if (lp_failures > 0) {
-        // LP engine failed on open nodes — not a proof of infeasibility
-        sol.status = Status::Error;
-        sol.message = std::string(b) + "; " + std::to_string(lp_failures) +
-                      " node LPs unsolved";
+        if (lp_infeasible == lp_failures) {
+            // every open subtree was LP-infeasible (cold certificates) —
+            // the MIP has no integer-feasible point
+            sol.status = Status::Infeasible;
+            sol.message = std::string(b) + "; all open subtrees "
+                          "LP-infeasible";
+        } else {
+            // LP engine failed on open nodes — not a proof of
+            // infeasibility
+            sol.status = Status::Error;
+            sol.message = std::string(b) + "; " +
+                          std::to_string(lp_failures) +
+                          " node LPs unsolved";
+        }
     } else {
         sol.status = Status::Infeasible;
         sol.message = "no integer-feasible solution found";

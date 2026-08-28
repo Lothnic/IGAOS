@@ -38,8 +38,7 @@ static void test_integer_infeasible() {
         "RHS\n RHS1 r1 3.0\nENDATA\n");
     assert(m.integ[0] == 1);
     Solution s = milp::solve(m, {});
-    assert(s.status != Status::Optimal);
-    assert(s.status != Status::Feasible);
+    assert(s.status == Status::Infeasible);
     assert(!s.message.empty());
     std::printf("milp-infeasible: %s (%s)\n", status_name(s.status),
                 s.message.c_str());
