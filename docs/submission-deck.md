@@ -36,7 +36,7 @@ pybind11 surface.
 
 | Evidence | Result | Artifact |
 |---|---|---|
-| Netlib LP ladder (64 inst ≤700 rows) | **52/64 exact vs HiGHS** (81%) | `docs/research/sweep_results.csv`, `demo/regress_netlib.py` |
+| Netlib LP ladder (64 inst ≤700 rows) | **60/64 exact vs HiGHS** (94%) | `docs/research/sweep_results.csv`, `demo/regress_netlib.py` |
 | False-unbounded bug class | fixed (pilot4 exact; perold honest error) | commit `4c49d09` |
 | Infeasibility detection | klein1 + refinery **proven** infeasible | `docs/research/robustness_results.csv` |
 | MPS edge cases | RANGES/FR/objective-constant correct (e226 exact) | `src/io/model.hpp` |
@@ -58,9 +58,11 @@ pybind11 surface.
   protocol; `solved@1e-4 / tight@1e-6` ladder.
 - Robustness suite: 10/15 per-class PASS (degeneracy, ill-conditioning,
   RANGES, free columns, infeasibility).
-- MIPLIB starter subset: **6/20 @1e-4** (flugpl 3.4s, air03 5.9s,
-  khb05250 32.2s proven optimal; 10/20 honest feasible incumbents) —
-  `docs/research/miplib_results.txt`. Target ≥12/20.
+- MIPLIB starter subset: **6/20 @1e-4** (flugpl 2.9s, air03 6.0s,
+  khb05250 4.2s, p0201 37.7s proven optimal; misc07/acc-tight2 matched)
+  — `docs/research/miplib_results.txt`. Weak set expires with honest
+  incumbents 2-15% off; documented blockers: node-LP speed, stronger
+  cut families.
 - Artifacts: `docs/research/benchmark-protocol.md`,
   `demo/bench_robustness.py`, `benchmarks/suites/robustness.yaml`
 
