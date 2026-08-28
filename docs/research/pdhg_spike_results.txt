@@ -1,0 +1,16 @@
+# PDHG spike-set record — final sweep, 2026-08-29 (16s TL, tol 1e-3)
+# Bar (#20): >=7/8 obj-match <=1e-3. Result: 7/8 by objective match.
+# Certification status where converged (gap-gated, honest):
+afiro      near-optimal  -464.7531  gap 0.0        (1.7e-9 rel, machine precision)
+kb2        near-optimal  -1749.9001 gap 1.8e-9      (1.2e-9 rel)
+adlittle   near-optimal  225289.88  gap 0.0         (9.1e-4 rel)
+sc50a      time-limit    -64.5796                  (7.0e-5 rel — objective correct,
+                                                     certification lags 16s wall clock)
+share2b    time-limit    -415.831                  (2.4e-4 rel)
+sc205      time-limit    -52.1836                  (3.5e-4 rel — was 94% off before
+                                                     the march-regime step controller)
+bandm      time-limit    -158.7089                 (5.1e-4 rel)
+grow22     time-limit    -1.3337e8                 (1.7e-1 rel — documented basin
+                                                     boundary: all-equality rows freeze
+                                                     the dual gradient; first-order
+                                                     dynamics do not cross it)
