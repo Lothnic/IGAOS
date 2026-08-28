@@ -1,11 +1,17 @@
 # PDHG spike-set record — final sweep, 2026-08-29 (16s TL, tol 1e-3)
 # Bar (#20): >=7/8 obj-match <=1e-3. Result: 7/8 by objective match.
+# Dual-repair pass (2026-08-29): duals missing exact feasibility at
+# infinite bounds made the Lagrangian bound -inf, so no time budget
+# could certify. Repair projects candidate duals onto the feasible
+# region (Cholesky + Hildreth + cone clamp, weak-duality-safe) — sc50a
+# and adlittle now certify in-budget. Also fixed: adlittle's previous
+# "certified gap 0.0" point was WRONG by 383 (prow metric now gates).
 # Certification status where converged (gap-gated, honest):
 afiro      near-optimal  -464.7531  gap 0.0        (1.7e-9 rel, machine precision)
 kb2        near-optimal  -1749.9001 gap 1.8e-9      (1.2e-9 rel)
-adlittle   near-optimal  225289.88  gap 0.0         (9.1e-4 rel)
-sc50a      time-limit    -64.5796                  (7.0e-5 rel — objective correct,
-                                                     certification lags 16s wall clock)
+adlittle   near-optimal  225495.48  gap 2.3e-6      (objective CORRECTED: prior certified
+                                                     point was wrong by 383 — prow gate)
+sc50a      near-optimal  -64.5687   gap 1.6e-4      (certified after dual repair)
 share2b    time-limit    -415.831                  (2.4e-4 rel)
 sc205      time-limit    -52.1836                  (3.5e-4 rel — was 94% off before
                                                      the march-regime step controller)

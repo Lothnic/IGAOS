@@ -62,11 +62,11 @@ pybind11 surface.
   protocol; `solved@1e-4 / tight@1e-6` ladder.
 - Robustness suite: 12/15 per-class PASS (degeneracy 4/4, infeasibility 3/3) (degeneracy, ill-conditioning,
   RANGES, free columns, infeasibility).
-- MIPLIB starter subset: **6/20 @1e-4** (flugpl 2.9s, air03 6.0s,
-  khb05250 4.2s, p0201 37.7s proven optimal; misc07/acc-tight2 matched)
-  — `docs/research/miplib_results.txt`. Weak set expires with honest
-  incumbents 2-15% off; documented blockers: node-LP speed, stronger
-  cut families.
+- MIPLIB starter subset: **8/20 @1e-4** — flugpl 9.1s, air03 1.2s,
+  khb05250 3.5s, p0201 4.9s, mod010 6.6s proven optimal; gt2, misc07,
+  acc-tight2 matched. RINS incumbent improvement + best-bound proof
+  (a latent multiset bug meant proof mode never actually ran before).
+  `docs/research/miplib_results.txt`; remaining blockers documented.
 - Artifacts: `docs/research/benchmark-protocol.md`,
   `demo/bench_robustness.py`, `benchmarks/suites/robustness.yaml`
 
