@@ -18,7 +18,9 @@ jobs:
           pip install pybind11 "highspy==1.15.1" pyyaml
       - name: Configure and build
         run: |
-          cmake -S . -B build -DCMAKE_PREFIX_PATH="$(pybind11 --cmakedir)"
+          PYBIND_DIR="$(python -c 'import pybind11; print(pybind11.get_cmake_dir())')"
+          echo "pybind11 cmake dir: $PYBIND_DIR"
+          cmake -S . -B build -DCMAKE_PREFIX_PATH="$PYBIND_DIR"
           cmake --build build -j "$(nproc)"
       - name: Engine tests
         run: ctest --test-dir build --output-on-failure
