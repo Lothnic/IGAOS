@@ -72,11 +72,14 @@ pybind11 surface.
   RANGES, free columns, infeasibility).
 - MIPLIB starter subset: **10/20 @1e-4** — p0201 1.2s, khb05250 1.7s,
   air03 2.2s, mod010 5.7s, flugpl 8.9s, blend2 21.0s proven optimal;
-  noswot (215k nodes), gt2, misc07, acc-tight2 matched. The sparse-LU
-  + Devex + presolve stack compounded: node LPs 10-30× faster.
-  stein45inf proven INFEASIBLE (961 nodes). Records:
-  `docs/research/miplib_results.txt`,
-  `docs/research/final_battery_2026-08-29.txt`.
+  noswot (215k nodes), gt2, misc07, acc-tight2 matched.
+- MIPLIB FULL Benchmark Set (240 instances, 60s TL): **4 closed**
+  (3 optimal-value + 1 infeasibility proof — all on instances OUTSIDE
+  the starter list), 10 more within 1%, 41 honest feasible incumbents,
+  185 time-limits. The hard set is designed to resist 60s budgets —
+  the complete honest record is `miplib_full_results.csv`. Our
+  from-scratch Rung-2 B&B closes what its design (no MIP presolve,
+  no primal-heuristic portfolio) allows, and says so.
 - Artifacts: `docs/research/benchmark-protocol.md`,
   `demo/bench_robustness.py`, `benchmarks/suites/robustness.yaml`
 
