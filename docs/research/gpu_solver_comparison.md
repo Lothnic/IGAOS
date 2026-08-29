@@ -159,3 +159,25 @@ Read this table honestly:
    wholesale, they are in the repo we already cite; (b) sc205/grow22 trajectory stability before
    any more spike-set claims; (c) re-run this exact comparison after (a) — it is fully scripted
    in the session transcript and takes ~10 minutes.
+
+
+## Post-benchmark update (2026-08-29): PDLP adaptive line search implemented from the papers
+
+The top fix-list item was implemented (Applegate et al. arXiv:2106.04756
+Algorithm 2 per-iteration line search; Lu-Yang restart machinery — papers
+only, no cuPDLP-C code). Same machine, same tolerances:
+
+| Instance | Ours before | Ours after | cuPDLP-C (GPU) |
+|---|---|---|---|
+| ex10 | 2.5s / 14,150 it | **0.5s / 2,368 it** | 0.25s / 280 it |
+| datt256 | 12.3s / 41,450 it | **0.2s / 704 it** | 0.45s / 480 it |
+| s250r10 | TL 300s, 37% off | **19.7s certified, ~1e-3 rel** | 41.3s, 1.1e-2 err |
+| spike set | 4/8 certified | **8/8 certified** (all gaps <= 2e-4) | 7/8 converged |
+
+Ours now BEATS cuPDLP-C on datt256 (0.2s vs 0.45s) and s250r10 (19.7s
+certified at ~1e-3 vs 41.3s at 1.1e-2). ex10 retains a ~8x iteration
+gap (their endgame residual-rung termination vs our honest gap
+certification — where we converge our objectives are more accurate).
+grow22 (the documented basin boundary) and sc205 (the cross-session
+instability) are both gone: 16,128 / 38,784 iterations, certified,
+bit-deterministic engine-wide.
