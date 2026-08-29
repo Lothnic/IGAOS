@@ -415,6 +415,16 @@ Solution solve(const io::Model& model, const Options& opt,
         accept_unsafe = false;
         expand_tol = 0.0;
         basis_dirty = true;  // force a factorization at phase entry
+        // Devex pricing (Forrest–Goldfarb 1992): reference weights w_j >= 1,
+        // entering column maximizes dj^2/w_j. Fresh framework (all 1) at each
+        // phase entry; reset when weights blow up or on deep degeneracy.
+        // IGAOS_DANZIG=1 in the environment falls back to plain Dantzig.
+        const bool use_devex = (getenv("IGAOS_DANZIG") == nullptr);
+        bool devex_on = use_devex;
+        vector<double> dw((size_t)E.total, 1.0);
+        const double DEVEX_RESET = getenv("IGAOS_DEVEX_RESET")
+                                       ? atof(getenv("IGAOS_DEVEX_RESET"))
+                                       : 1e6;
         auto verify_pivot_invariant = [&](const char* tag, int enter,
                                           int lpos, long lvar, double th,
                                           double dr) {
@@ -633,6 +643,7 @@ Solution solve(const io::Model& model, const Options& opt,
 
             int enter0 = -1;
             double best_score = opt.tolerance * 1e-2;
+            double best_devex = 0.0;
             double dir0 = 1.0;
             for (long j = 0; j < E.total; ++j) {
                 if (st[j] == BASIC) continue;
@@ -641,21 +652,42 @@ Solution solve(const io::Model& model, const Options& opt,
                     E.up[j] - E.lo[j] <= 1e-12)
                     continue;
                 double dj = E.reduced_cost_part((int)j, y);
-                if (st[j] == FREE_NB) {
-                    double score = std::fabs(dj);
-                    if (score > best_score) {
-                        best_score = score;
+                if (!devex_on) {
+                    if (st[j] == FREE_NB) {
+                        double score = std::fabs(dj);
+                        if (score > best_score) {
+                            best_score = score;
+                            enter0 = (int)j;
+                            dir0 = dj > 0 ? -1.0 : 1.0;
+                        }
+                    } else if (st[j] == AT_LOWER && dj < -best_score) {
+                        best_score = -dj;
                         enter0 = (int)j;
-                        dir0 = dj > 0 ? -1.0 : 1.0;
+                        dir0 = 1.0;
+                    } else if (st[j] == AT_UPPER && dj > best_score) {
+                        best_score = dj;
+                        enter0 = (int)j;
+                        dir0 = -1.0;
                     }
-                } else if (st[j] == AT_LOWER && dj < -best_score) {
-                    best_score = -dj;
+                    continue;
+                }
+                // Devex: same eligibility as Dantzig (|dj| above tolerance),
+                // rank by dj^2/w_j (FREE_NB uses |dj|^2/w_j).
+                double mag;
+                if (st[j] == FREE_NB) {
+                    mag = std::fabs(dj);
+                } else if (st[j] == AT_LOWER) {
+                    mag = -dj;
+                } else {
+                    mag = dj;
+                }
+                if (mag <= best_score) continue;
+                double score = (dj * dj) / dw[j];
+                if (score > best_devex) {
+                    best_devex = score;
                     enter0 = (int)j;
-                    dir0 = 1.0;
-                } else if (st[j] == AT_UPPER && dj > best_score) {
-                    best_score = dj;
-                    enter0 = (int)j;
-                    dir0 = -1.0;
+                    dir0 = (st[j] == FREE_NB) ? (dj > 0 ? -1.0 : 1.0)
+                              : (st[j] == AT_LOWER ? 1.0 : -1.0);
                 }
             }
             if (enter0 < 0 && bland) {
@@ -999,6 +1031,9 @@ Solution solve(const io::Model& model, const Options& opt,
                 if (degen_streak >= 20 && !bland) {
                     bland = true;
                     degen_streak = 0;
+                    // degenerate stall: the reference framework has drifted —
+                    // restart Devex weights from a fresh one
+                    if (devex_on) std::fill(dw.begin(), dw.end(), 1.0);
                 }
                 // deep stall: even Bland is not escaping — perturb costs
                 // once (HiGHS-recipe flavor, robustness-strategy rung 4);
@@ -1031,6 +1066,10 @@ Solution solve(const io::Model& model, const Options& opt,
                 // off the TRUE bounds) when the crawl resumes — a new draw
                 // escapes a different tie structure.
                 if (crawl_steps >= 2000 && bound_perturb_count < 16) {
+                    // deep degeneracy crawl that Devex weights are not
+                    // helping (observed: modszk1 4k -> 31k iterations) —
+                    // drop the weight heuristic for the rest of the phase
+                    devex_on = false;
                     if (!bounds_perturbed) {
                         bounds_perturbed = true;
                         lo0 = E.lo;
@@ -1079,6 +1118,51 @@ Solution solve(const io::Model& model, const Options& opt,
                 z[enter0] = (dir0 > 0) ? E.up[enter0] : E.lo[enter0];
                 verify_pivot_invariant("flip", enter0, -1, -1, theta, dir0);
                 continue;
+            }
+
+            // Devex weight update (Forrest–Goldfarb 1992): with pivot row r,
+            // entering q, pivot alpha_rq:
+            //   w_j = max(w_j, (alpha_rj/alpha_rq)^2 * w_q)  (nonbasic j)
+            //   w_leaving = max(w_q/alpha_rq^2, 1)
+            // alpha_rj = (e_r^T B^{-1}) A_j; rho = B^{-T} e_r gives the row
+            // via the row-major matrix copy (slack/art columns handled
+            // directly). Framework resets when any weight exceeds 1e6.
+            if (devex_on && leave_pos >= 0) {
+                vector<double> unit(E.m, 0.0);
+                unit[leave_pos] = 1.0;
+                vector<double> rho;
+                lu.solve_transpose(unit, rho);
+                const double arq = alpha[leave_pos];
+                const double wq = dw[enter0];
+                const double wq_arq2 = wq / (arq * arq);
+                vector<double> prow((size_t)E.total, 0.0);
+                for (int i = 0; i < E.m; ++i) {
+                    if (rho[i] == 0.0) continue;
+                    const double ri = rho[i];
+                    for (int p = E.ap[i]; p < E.ap[i + 1]; ++p)
+                        prow[E.ai[p]] += ri * E.av[p];
+                }
+                double wmax = 1.0;
+                for (long j = 0; j < E.total; ++j) {
+                    if (st[j] == BASIC) continue;
+                    double arj = 0.0;
+                    if (j < E.nx) {
+                        arj = prow[j];
+                    } else if (E.kind[j] == KIND_SLACK) {
+                        arj = -rho[j - E.nx];
+                    } else {  // KIND_ART
+                        long k = j - E.nx - E.m;
+                        arj = rho[E.art_row[k]] * E.art_sigma[k];
+                    }
+                    if (arj != 0.0)
+                        dw[j] = std::max(dw[j], arj * arj * wq_arq2);
+                    wmax = std::max(wmax, dw[j]);
+                }
+                int leaving_var = basis[leave_pos];
+                dw[leaving_var] = std::max(wq_arq2, 1.0);
+                wmax = std::max(wmax, dw[leaving_var]);
+                if (wmax > DEVEX_RESET)
+                    std::fill(dw.begin(), dw.end(), 1.0);
             }
 
             int leaving = basis[leave_pos];
