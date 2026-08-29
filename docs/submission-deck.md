@@ -50,11 +50,16 @@ pybind11 surface.
   sovereign core — every engine implemented from mathematical
   foundations: primal+dual revised simplex, product-form eta updates,
   Gomory MI cuts, OSQP-style ADMM QP.
-- **Measured crossover** (docs/research/gpu_showcase.md): at 1.16M nnz
-  PDHG solves ex10 in 4.1s vs HiGHS 1-thread 76.2s (**18.6×**); datt256
-  (1.5M nnz) 32.4s vs HiGHS killed at 2,433s (**>75×**). Below 1M nnz
-  (ken-18) HiGHS wins — reported with equal prominence. Measured, not
-  claimed.
+- **Measured vs CPU simplex** (docs/research/gpu_showcase.md): at 1.16M
+  nnz PDHG solves ex10 in 3.0-4.1s vs HiGHS CPU simplex 76.2s; datt256
+  12-32s vs HiGHS killed at 2,433s. Below 1M nnz (ken-18) HiGHS wins.
+- **vs the first-order field, honestly** (docs/research/
+  gpu_solver_comparison.md): cuPDLP-C on the same GPU is 12-27× faster
+  (their line-search/restart machinery: 280 vs our 14,150 iterations
+  on ex10). Our differentiators: exact objectives where we converge
+  (1.6e-9 vs their 1e-4), a certified-gap termination, and zero
+  solver-library dependencies. Closing the iteration gap via the
+  published PDLP techniques is the roadmap's first item.
 
 ## Slide 7 — Benchmark honesty
 
