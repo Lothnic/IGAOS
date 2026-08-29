@@ -148,10 +148,10 @@ struct Engine {
         return lu.ok;
     }
 
-Solution solve(const io::Model& model, const Options& opt,
-               const WarmStart* warm, WarmStart* warm_out,
-               std::vector<CutRow>* cuts_out,
-               const std::vector<unsigned char>* true_integ) {
+static Solution solve_impl(const io::Model& model, const Options& opt,
+                           const WarmStart* warm, WarmStart* warm_out,
+                           std::vector<CutRow>* cuts_out,
+                           const std::vector<unsigned char>* true_integ) {
     Solution sol;
     auto t0 = std::chrono::steady_clock::now();
     auto elapsed = [&]() {
@@ -1999,6 +1999,30 @@ Solution solve(const io::Model& model, const Options& opt,
             if (basis[i] < work.n + work.m) warm_out->basis[i] = basis[i];
         warm_out->nb_state.assign(st.begin(),
                                   st.begin() + (work.n + work.m));
+    }
+    return sol;
+}
+
+Solution solve(const io::Model& model, const Options& opt,
+               const WarmStart* warm, WarmStart* warm_out,
+               std::vector<CutRow>* cuts_out,
+               const std::vector<unsigned char>* true_integ) {
+    Solution sol = solve_impl(model, opt, warm, warm_out, cuts_out,
+                              true_integ);
+    // Presolve-reduced models occasionally walk the simplex into a
+    // near-singular-basis cascade the recovery machinery can't escape
+    // (observed: wood1p reduced 244x2594 -> 172x1802, sparse-LU pivot
+    // floor rejects, rollback blocks exhaust -> "basis factorization
+    // failed"). Honest fallback: an ERROR on a presolved cold solve is
+    // retried on the unreduced model — a retry can only spend time,
+    // never mask a wrong answer (Error is loud by construction).
+    if (sol.status == Status::Error && opt.presolve && warm == nullptr &&
+        warm_out == nullptr && cuts_out == nullptr && !model.has_quadratic()) {
+        Options o2 = opt;
+        o2.presolve = false;
+        sol = solve_impl(model, o2, warm, warm_out, cuts_out, true_integ);
+        if (sol.status != Status::Error)
+            sol.message += " (recovered: presolve-off retry)";
     }
     return sol;
 }
