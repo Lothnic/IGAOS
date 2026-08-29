@@ -1,0 +1,44 @@
+=== 1/4 NETLIB GATE ===
+  time-limit   d6cube
+
+63/64 exact (recorded best 49), 0 optimal-mismatch, 1 non-optimal
+=== 2/4 ROBUSTNESS SUITE ===
+
+results -> docs/research/robustness_results.csv
+per class: A:4/4  B:2/2  C:1/2  D:1/2  E:1/2  F:3/3
+TOTAL: 12/15 PASS
+=== 3/4 MIPLIB 20 ===
+hanoi5       ref[=opt=]=1931.0             IGA[time-limit]=0                     60.0s  MISMATCH  (wall-clock budget exhausted)
+gt2          ref[=opt=]=21165.99999999978  IGA[feasible]=25870                 60.0s  MISMATCH  (358555 nodes / 359326 LPs explored)
+p0201        ref[=opt=]=7614.999999999997  IGA[optimal]=7615                   1.2s  exact  (1079 nodes / 893 LPs explored)
+mod010       ref[=opt=]=6548.0             IGA[optimal]=6548                   5.7s  exact  (2349 nodes / 1956 LPs explored)
+flugpl       ref[=opt=]=1201500.0          IGA[optimal]=1201500                8.9s  exact  (9875 nodes / 21928 LPs explored)
+air03        ref[=opt=]=340160.0           IGA[optimal]=340160                 2.2s  exact  (219 nodes / 227 LPs explored)
+blend2       ref[=opt=]=7.598985           IGA[optimal]=7.598985              21.0s  exact  (15461 nodes / 10449 LPs explored)
+ran12x21     ref[=opt=]=3663.999999980964  IGA[feasible]=3995                  60.0s  MISMATCH  (80374 nodes / 80428 LPs explored)
+ran13x13     ref[=opt=]=3252.0             IGA[feasible]=3333                  60.0s  MISMATCH  (176329 nodes / 176357 LPs explored)
+misc07       ref[=opt=]=2810.0             IGA[feasible]=2810                  60.0s  exact  (24855 nodes / 24861 LPs explored)
+dsbmip       ref[=opt=]=-305.19817501      IGA[error]=0                      0.3s  MISMATCH  (1 nodes / 1 LPs explored; 1 node LPs unsolved)
+khb05250     ref[=opt=]=106940225.9999999  IGA[optimal]=106940226              1.7s  exact  (183 nodes / 199 LPs explored)
+cap6000      ref[=opt=]=-2451377.0         IGA[feasible]=-2451243              60.0s  solved  (1218 nodes / 5877 LPs explored)
+acc-tight2   ref[=opt=]=0.0                IGA[time-limit]=0                     63.9s  exact  (wall-clock budget exhausted)
+aflow30a     ref[=opt=]=1158.0             IGA[feasible]=2318                  60.0s  MISMATCH  (3478 nodes / 3812 LPs explored)
+10teams      ref[=opt=]=923.9999999999997  IGA[Timeout]=nan                   90.0s  n/a
+mas76        ref[=opt=]=40005.05398999999  IGA[feasible]=40115.93379           60.0s  MISMATCH  (375286 nodes / 375323 LPs explored)
+noswot       ref[=opt=]=-41.00000885       IGA[feasible]=-41                   60.0s  exact  (215470 nodes / 215861 LPs explored)
+stein45inf   ref[=inf=]=None               IGA[infeasible]=0                     18.7s  n/a  (961 nodes / 3723 LPs explored; all open subtrees LP-infeasible)
+timtab1      ref[=opt=]=764771.99999978    IGA[time-limit]=0                     60.0s  MISMATCH  (wall-clock budget exhausted)
+
+10/20 matched solufile @<=1e-4
+=== 4/4 PDHG ===
+afiro: near-optimal -464.7531 gap 0.0
+kb2: near-optimal -1749.9002 gap 0.0
+sc50a: near-optimal -64.5751 gap 5.601e-07
+adlittle: near-optimal 225497.4978 gap 1.88e-05
+share2b: near-optimal -415.7233 gap 2.149e-05
+sc205: near-optimal -52.2018 gap 0.0001927
+bandm: near-optimal -158.6279 gap 4.513e-07
+grow22: near-optimal -160834337.4 gap 2.715e-06
+ex10: near-optimal 100.000007 2368 it 0.5 s
+datt256_lp: near-optimal 256.001822 704 it 0.2 s
+s250r10: near-optimal -0.17268 59392 it 17.6 s

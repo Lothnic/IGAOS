@@ -69,11 +69,13 @@ pybind11 surface.
   protocol; `solved@1e-4 / tight@1e-6` ladder.
 - Robustness suite: 12/15 per-class PASS (degeneracy 4/4, infeasibility 3/3) (degeneracy, ill-conditioning,
   RANGES, free columns, infeasibility).
-- MIPLIB starter subset: **8/20 @1e-4** — flugpl 9.1s, air03 1.2s,
-  khb05250 3.5s, p0201 4.9s, mod010 6.6s proven optimal; gt2, misc07,
-  acc-tight2 matched. RINS incumbent improvement + best-bound proof
-  (a latent multiset bug meant proof mode never actually ran before).
-  `docs/research/miplib_results.txt`; remaining blockers documented.
+- MIPLIB starter subset: **10/20 @1e-4** — p0201 1.2s, khb05250 1.7s,
+  air03 2.2s, mod010 5.7s, flugpl 8.9s, blend2 21.0s proven optimal;
+  noswot (215k nodes), gt2, misc07, acc-tight2 matched. The sparse-LU
+  + Devex + presolve stack compounded: node LPs 10-30× faster.
+  stein45inf proven INFEASIBLE (961 nodes). Records:
+  `docs/research/miplib_results.txt`,
+  `docs/research/final_battery_2026-08-29.txt`.
 - Artifacts: `docs/research/benchmark-protocol.md`,
   `demo/bench_robustness.py`, `benchmarks/suites/robustness.yaml`
 
