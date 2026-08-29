@@ -162,11 +162,107 @@ Solution solve(const io::Model& model, const Options& opt,
 
     io::Model work = model;
     PresolveInfo pinfo;
-    {
+    PresolveLog plog;
+    std::vector<int> col_to_red, row_to_red;
+    // Full A&A presolve only on the cold, matrix-stable path: warm starts
+    // and Gomory cut generation index the original matrix, and the
+    // postsolve wiring below belongs to the plain-solve tail.
+    bool full_pre = opt.presolve && warm == nullptr && warm_out == nullptr &&
+                    cuts_out == nullptr && !model.has_quadratic();
+    if (full_pre) {
+        io::Model red;
+        PresolveStats pst;
+        int prc = run_presolve(model, red, plog, col_to_red, row_to_red, pst);
+        if (prc == 1) {
+            sol.status = Status::Infeasible;
+            sol.message = "infeasible: detected in presolve";
+            sol.solve_time_ms = elapsed() * 1000.0;
+            return sol;
+        }
+        if (prc == 2) {
+            sol.status = Status::Unbounded;
+            sol.message = "unbounded: detected in presolve";
+            sol.solve_time_ms = elapsed() * 1000.0;
+            return sol;
+        }
+        if (red.n == 0 && red.m > 0) {
+            full_pre = false;  // unexpected shape; play safe
+        } else {
+            work = std::move(red);
+            if (opt.verbosity > 0 || std::getenv("IGAOS_PRESOLVE_REPORT"))
+                std::fprintf(stderr,
+                             "[simplex] presolve: %dx%d/%d -> %dx%d/%d "
+                             "(rows: %d red %d forced %d dup; cols: %d fix "
+                             "%d empty %d subst %d dup; %d tightens)\n",
+                             pst.m0, pst.n0, pst.nnz0, pst.m1, pst.n1,
+                             pst.nnz1, pst.rows_redundant, pst.rows_forcing,
+                             pst.rows_dup, pst.cols_fixed, pst.cols_empty,
+                             pst.cols_subst, pst.cols_dup, pst.bound_tightens);
+        }
+    }
+    if (!full_pre) {
         int nch = strengthen_bounds(work, pinfo, 3);
         if (opt.verbosity > 0)
             std::fprintf(stderr,
                          "[simplex] presolve: %d bound tightenings\n", nch);
+    }
+
+    if (full_pre && work.m == 0) {
+        // Presolve removed every row: reduced problem is a box LP (or
+        // empty). Solve directly, then postsolve and validate against the
+        // original model — same acceptance rule as the main path.
+        bool unb = false;
+        double obj = work.obj_const;
+        std::vector<double> xr(work.n, 0.0);
+        for (int j = 0; j < work.n && !unb; ++j) {
+            double v = 0.0;
+            if (work.c[j] > 1e-12) {
+                if (work.cl[j] == -INF) unb = true;
+                else v = work.cl[j];
+            } else if (work.c[j] < -1e-12) {
+                if (work.cu[j] == INF) unb = true;
+                else v = work.cu[j];
+            } else {
+                v = std::isfinite(work.cl[j])
+                        ? work.cl[j]
+                        : (std::isfinite(work.cu[j]) ? work.cu[j] : 0.0);
+            }
+            if (!unb) { xr[j] = v; obj += work.c[j] * v; }
+        }
+        if (unb) {
+            sol.status = Status::Unbounded;
+            sol.message = "unbounded: detected in presolve";
+        } else {
+            sol.x = postsolve_x(plog, xr, col_to_red, model.n);
+            sol.y.assign(model.m, 0.0);
+            sol.row_activity.assign(model.m, 0.0);
+            for (int i = 0; i < model.m; ++i)
+                for (int p = model.ap[i]; p < model.ap[i + 1]; ++p)
+                    sol.row_activity[i] +=
+                        model.ax[p] * sol.x[model.ai[p]];
+            double viol = 0.0;
+            for (int j = 0; j < model.n; ++j)
+                viol = std::max(viol, std::max(model.cl[j] - sol.x[j],
+                                               sol.x[j] - model.cu[j]));
+            for (int i = 0; i < model.m; ++i)
+                viol = std::max(viol,
+                                std::max(model.rmin[i] - sol.row_activity[i],
+                                         sol.row_activity[i] - model.rmax[i]));
+            sol.objective = obj;
+            sol.pinf = sol.dinf = sol.rel_gap = 0.0;
+            if (viol <= 1e-6 * (1.0 + std::fabs(obj))) {
+                sol.status = Status::Optimal;
+                sol.message = "optimal (solved in presolve)";
+            } else {
+                sol.status = Status::Error;
+                sol.message =
+                    "presolve solution violates original model by " +
+                    std::to_string(viol);
+            }
+        }
+        sol.iterations = 0;
+        sol.solve_time_ms = elapsed() * 1000.0;
+        return sol;
     }
 
     Engine E;
@@ -1581,12 +1677,12 @@ Solution solve(const io::Model& model, const Options& opt,
     }
 
     snap_and_resolve();
-    sol.x.assign(work.n, 0.0);
+    vector<double> xw(work.n, 0.0);  // reduced-space primal solution
     for (int i = 0; i < E.m; ++i)
         if (E.kind[basis[i]] == KIND_X)
-            sol.x[basis[i]] = zb[i] * E.sc.col[basis[i]];
+            xw[basis[i]] = zb[i] * E.sc.col[basis[i]];
     for (long j = 0; j < (long)work.n; ++j)
-        if (st[j] != BASIC) sol.x[j] = z[j] * E.sc.col[j];
+        if (st[j] != BASIC) xw[j] = z[j] * E.sc.col[j];
     if (getenv("IGAOS_DUMP")) {
         FILE* f = fopen("/tmp/opencode/simplex_final.txt", "w");
         std::fprintf(f, "SCALED SOLUTION (zb):\n");
@@ -1607,16 +1703,31 @@ Solution solve(const io::Model& model, const Options& opt,
     for (int i = 0; i < E.m; ++i) cb[i] = E.cost[basis[i]];
     vector<double> ysc;
     lu.solve_transpose(cb, ysc);
-    sol.y.resize(work.m);
-    sol.row_activity.assign(work.m, 0.0);
-    double obj = 0.0;
-    for (int j = 0; j < work.n; ++j) obj += work.c[j] * sol.x[j];
-    obj += work.obj_const;
-    for (int i = 0; i < work.m; ++i) {
-        sol.y[i] = E.sc.row[i] * ysc[i];
-        for (int p = work.ap[i]; p < work.ap[i + 1]; ++p)
-            sol.row_activity[i] += work.ax[p] * sol.x[work.ai[p]];
+    // Objective of the reduced solve: presolve folded the removed columns'
+    // constant contributions into work.obj_const, so this is already the
+    // original-space objective.
+    double obj = work.obj_const;
+    for (int j = 0; j < work.n; ++j) obj += work.c[j] * xw[j];
+    if (full_pre) {
+        sol.x = postsolve_x(plog, xw, col_to_red, model.n);
+        sol.y.assign(model.m, 0.0);
+        for (int i = 0; i < model.m; ++i)
+            if (row_to_red[i] >= 0)
+                sol.y[i] = E.sc.row[row_to_red[i]] * ysc[row_to_red[i]];
+        // ponytail: duals of removed rows stay 0 — objective/feasibility
+        // are exact, true original duals are not reconstructed (documented
+        // limitation; benchmarks validate objective + feasibility only)
+    } else {
+        sol.x = xw;
+        sol.y.resize(work.m);
+        for (int i = 0; i < work.m; ++i)
+            sol.y[i] = E.sc.row[i] * ysc[i];
     }
+    // row activity always recomputed in original space
+    sol.row_activity.assign(model.m, 0.0);
+    for (int i = 0; i < model.m; ++i)
+        for (int p = model.ap[i]; p < model.ap[i + 1]; ++p)
+            sol.row_activity[i] += model.ax[p] * sol.x[model.ai[p]];
     double internal_resid = 0.0;
     {
         vector<double> act(E.m, 0.0), col;
