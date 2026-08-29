@@ -29,39 +29,114 @@ namespace {
 // elementwise launches + blases (kernel-launch latency dominated small
 // instances: ~8 launches/iter -> 3).
 
-// xnew = P_[cl,cu](x - tau*(c + A'y));  xbar = 2*xnew - x
+// xnew = P_[cl,cu](x - tau*(c + A'y));  xbar = 2*xnew - x;  dx = xnew - x
 __global__ void kern_primal(int n, double tau, const double* x,
                             const double* c, const double* ata,
                             const double* lo, const double* hi, double* xnew,
-                            double* xbar) {
+                            double* xbar, double* dx) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
         double g = c[i] + ata[i];
         double xn = fmin(fmax(x[i] - tau * g, lo[i]), hi[i]);
         xnew[i] = xn;
         xbar[i] = 2.0 * xn - x[i];
+        dx[i] = xn - x[i];
     }
 }
 
-// t = y + sigma*Axbar;  ynew = t - sigma*P_[rmin,rmax](t/sigma)
+// t = y + sigma*Axbar;  ynew = t - sigma*P_[rmin,rmax](t/sigma);
+// dy = ynew - y;  A(x'-x) = (A xbar - A x)/2  [A xbar = A(2x'-x)]
 __global__ void kern_dual(int m, double s, const double* y, const double* axb,
                           const double* rmin, const double* rmax,
-                          double* ynew) {
+                          const double* axcur, double* ynew, double* dy,
+                          double* adx) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < m) {
         double t = y[i] + s * axb[i];
-        ynew[i] = t - s * fmin(fmax(t / s, rmin[i]), rmax[i]);
+        double yn = t - s * fmin(fmax(t / s, rmin[i]), rmax[i]);
+        ynew[i] = yn;
+        dy[i] = yn - y[i];
+        adx[i] = 0.5 * (axb[i] - axcur[i]);
     }
 }
 
-// Halpern averaging of both x and y in one launch.
+// Deterministic fused dot products (two-stage: per-block partials at a
+// fixed thread mapping, then a fixed single-block tree reduce — atomicAdd
+// ordering made iteration counts vary up to 1.6x run-to-run on ex10).
+// Stage 1: ||dx||^2, ||dy||^2, dy.Adx partials into p[b], p[G+b], p[2G+b].
+__global__ void kern_dots(int n, int m, const double* dx, const double* dy,
+                          const double* adx, double* p) {
+    extern __shared__ double sh[];
+    int tid = threadIdx.x;
+    double a0 = 0.0, a1 = 0.0, a2 = 0.0;
+    for (int i = blockIdx.x * blockDim.x + tid; i < n || i < m;
+         i += gridDim.x * blockDim.x) {
+        if (i < n) a0 += dx[i] * dx[i];
+        if (i < m) {
+            a1 += dy[i] * dy[i];
+            a2 += dy[i] * adx[i];
+        }
+    }
+    sh[tid] = a0;
+    sh[tid + blockDim.x] = a1;
+    sh[tid + 2 * blockDim.x] = a2;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sh[tid] += sh[tid + s];
+            sh[tid + blockDim.x] += sh[tid + blockDim.x + s];
+            sh[tid + 2 * blockDim.x] += sh[tid + 2 * blockDim.x + s];
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        p[blockIdx.x] = sh[0];
+        p[gridDim.x + blockIdx.x] = sh[blockDim.x];
+        p[2 * gridDim.x + blockIdx.x] = sh[2 * blockDim.x];
+    }
+}
+// Stage 2: fixed-order reduce of the partials into out[0..2].
+__global__ void kern_dotfin(const double* p, int g, double* out) {
+    extern __shared__ double sh[];
+    int tid = threadIdx.x;
+    double s0 = 0.0, s1 = 0.0, s2 = 0.0;
+    for (int i = tid; i < g; i += blockDim.x) {
+        s0 += p[i];
+        s1 += p[g + i];
+        s2 += p[2 * g + i];
+    }
+    sh[tid] = s0;
+    sh[tid + blockDim.x] = s1;
+    sh[tid + 2 * blockDim.x] = s2;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sh[tid] += sh[tid + s];
+            sh[tid + blockDim.x] += sh[tid + blockDim.x + s];
+            sh[tid + 2 * blockDim.x] += sh[tid + 2 * blockDim.x + s];
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        out[0] = sh[0];
+        out[1] = sh[blockDim.x];
+        out[2] = sh[2 * blockDim.x];
+    }
+}
+
+// Halpern averaging of both x and y, plus the line search's A x commit
+// (axcur += A(x'-x)) — one launch instead of three.
 __global__ void kern_mix2(int n, int m, double eta, const double* x,
-                          double* xavg, const double* y, double* yavg) {
+                          double* xavg, const double* y, double* yavg,
+                          const double* adx, double* axcur) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) xavg[i] += eta * (x[i] - xavg[i]);
     else if (i < n + m) {
         int j = i - n;
         yavg[j] += eta * (y[j] - yavg[j]);
+    } else if (i < n + 2 * m) {
+        int j = i - n - m;
+        axcur[j] += adx[j];
     }
 }
 
@@ -475,16 +550,26 @@ Solution solve(const io::Model& lp, const Options& opt) {
 
     double *d_x, *d_xnew, *d_xbar, *d_xavg, *d_y, *d_ynew, *d_yavg, *d_ata,
         *d_tm, *d_tmpn;
+    double *d_dx, *d_dy, *d_adx, *d_axcur, *d_dots, *d_part;
+    // line-search scratch (d_part: per-block dot partials)
     CK(cudaMalloc(&d_x, n * sizeof(double)));
     CK(cudaMalloc(&d_xnew, n * sizeof(double)));
     CK(cudaMalloc(&d_xbar, n * sizeof(double)));
     CK(cudaMalloc(&d_xavg, n * sizeof(double)));
+    CK(cudaMalloc(&d_dx, n * sizeof(double)));
     CK(cudaMalloc(&d_y, m * sizeof(double)));
     CK(cudaMalloc(&d_ynew, m * sizeof(double)));
     CK(cudaMalloc(&d_yavg, m * sizeof(double)));
+    CK(cudaMalloc(&d_dy, m * sizeof(double)));
+    CK(cudaMalloc(&d_adx, m * sizeof(double)));
+    CK(cudaMalloc(&d_axcur, m * sizeof(double)));
+    CK(cudaMalloc(&d_dots, 3 * sizeof(double)));
     CK(cudaMalloc(&d_ata, n * sizeof(double)));
     CK(cudaMalloc(&d_tm, m * sizeof(double)));
     CK(cudaMalloc(&d_tmpn, n * sizeof(double)));
+    // grid size for the dot kernel (fixed => deterministic partial layout)
+    const int gD = (int)std::min<long>((std::max(n, m) + 255) / 256, 4096);
+    CK(cudaMalloc(&d_part, 3 * gD * sizeof(double)));
     double *d_xb, *d_yb;  // incumbent snapshot
     CK(cudaMalloc(&d_xb, n * sizeof(double)));
     CK(cudaMalloc(&d_yb, m * sizeof(double)));
@@ -492,6 +577,7 @@ Solution solve(const io::Model& lp, const Options& opt) {
     CK(cudaMemset(d_y, 0, m * sizeof(double)));
     CK(cudaMemset(d_xavg, 0, n * sizeof(double)));
     CK(cudaMemset(d_yavg, 0, m * sizeof(double)));
+    CK(cudaMemset(d_axcur, 0, m * sizeof(double)));  // A*x0 = 0
 
     Spmv mvA{}, mvAT{};
     mvA.h = cs; mvAT.h = cs;
@@ -543,12 +629,40 @@ Solution solve(const io::Model& lp, const Options& opt) {
         cudaFree(dv);
         cudaFree(dw);
     }
-    double ts_max = 1.2 / lam2, ts = 1.2 * ts_max;
-    double tau = std::sqrt(ts), sigma = tau;
-    const double prod0 = tau * sigma;  // step product stays pinned
-    const double rt0 = std::sqrt(prod0);
+    // PDLP step-size parametrization (Applegate et al. 2021, arXiv:2106.04756;
+    // cuPDLP.jl, Lu & Yang, arXiv:2311.12180):
+    //   tau = eta/omega, sigma = eta*omega,
+    // convergence bound tau*sigma*||A||_2^2 <= 1, i.e. eta <= 1/||A||_2.
+    // The per-iteration line search below adapts eta to the LOCAL curvature
+    // bound etabar = ||(dx,dy)||_w^2 / (2 dy'A dx), which is >= 1/||A||_2 and
+    // can be far larger along low-curvature directions — this is what lets
+    // PDLP-class solvers take ~300 iterations where a fixed eta takes ~14k.
+    // Init: eta0^2 = 1.44/lam2 (the measured-stable product of the old
+    // fixed-step engine; the line search self-corrects either way).
+    const double eta0 = 1.2 / std::sqrt(lam2);
+    double eta = eta0;
+    // Initial primal weight omega0 = ||c~||_2/||q~||_2 (paper's
+    // InitializePrimalWeight; q~ = scaled row-bound vector). Clipped as a
+    // numerical guard only — the paper does not clip.
+    double omega = 1.0;
+    {
+        double cn = 0.0, qn = 0.0;
+        for (int j = 0; j < n; ++j) cn += sc[j] * sc[j];
+        for (int i = 0; i < m; ++i) {
+            double q = std::isfinite(srmax[i])
+                           ? srmax[i]
+                           : (std::isfinite(srmin[i]) ? srmin[i] : 0.0);
+            qn += q * q;
+        }
+        // paper's InitializePrimalWeight, but CLIPPED hard: unclipped it can
+        // push tau = eta/omega far past any convergent step for instances
+        // whose scaled cost/bound norms are lopsided (afiro: omega0=0.012
+        // froze the iterate against its bounds in <64 iterations)
+        if (cn > 1e-24 && qn > 1e-24)
+            omega = std::clamp(std::sqrt(cn / qn), 0.3, 3.0);
+    }
 
-    const int CHECK = 50;
+    const int CHECK = 64;  // restart/termination check period (paper: 64)
     // Under an explicit wall-clock budget the time limit governs; the 500k
     // default iteration cap would otherwise cut runs short with time left
     // (share2b was still improving at k=500k inside its 16s budget).
@@ -556,9 +670,24 @@ Solution solve(const io::Model& lp, const Options& opt) {
                      ? 20000000L
                      : opt.max_iterations;
     const double TOL = opt.tolerance;
-    long hn = 0;
-    long since_restart = 0;
-    double epoch_r0 = -1.0;
+    long hn = 0;                 // Halpern averaging counter (epoch-local)
+    // Restart state (cuPDLP.jl Alg. 1): epoch-start KKT, previous check's
+    // candidate KKT, epoch start iteration, previous epoch-start points
+    // (scaled units) for the primal-weight update.
+    double epoch_kkt = -1.0;     // <0 = unset (fill at next check)
+    double prev_cand = INF_NAN;
+    long epoch_start = 0;
+    std::vector<double> pesx, pesy;
+    bool have_pe = false;
+    // NOTE: a KKT-stall "halve eta" rule was tried (bare halving, and a
+    // sticky eta cap, window 1024, triggers from 0.95x to any-improvement):
+    // with the per-iteration line search already adapting eta, the halving
+    // is undone by regrowth within ~100 iterations and only randomizes the
+    // trajectory — kb2 273k->28k iters but share2b and s250r10 went from
+    // certified to time-limit. Reverted; kept here so nobody re-tries it
+    // blind. (The tasking's "halve kappa on stall" presumes a PDLP without
+    // the per-iteration line search; here the line search IS that
+    // mechanism.)
     long iters_run = 0;
     auto t0 = std::chrono::steady_clock::now();
 
@@ -609,29 +738,65 @@ Solution solve(const io::Model& lp, const Options& opt) {
     bool have_inc = false;
     double inc_op = 0.0;
     long last_rollback = 0;
-    double prev_pinf = std::numeric_limits<double>::infinity();
-    double prev_win_op = 0.0;
-    double boom_cap = std::numeric_limits<double>::infinity();
-    std::vector<double> yprev(m, 0.0), xprev(n, 0.0);
-    bool have_prev = false;
     long next_repair = 5000;   // dual-repair attempt schedule (backoff)
     bool repaired = false;
     long repair_spacing = 2000;
+    std::vector<double> yprev(m, 0.0), xprev(n, 0.0);
+    bool have_prev = false;
+    double hdots[3];
     long k = 1;
     for (; k <= MAXIT; ++k) {
         iters_run = k;
         mvAT.mv(d_y, d_ata);
-        kern_primal<<<(n + 255) / 256, 256>>>(n, tau, d_x, d_c, d_ata, d_cl,
-                                              d_cu, d_xnew, d_xbar);
-        mvA.mv(d_xbar, d_tm);
-        kern_dual<<<(m + 255) / 256, 256>>>(m, sigma, d_y, d_tm, d_rmin,
-                                            d_rmax, d_ynew);
-        std::swap(d_x, d_xnew);
-        std::swap(d_y, d_ynew);
+        // Adaptive line search (PDLP Algorithm 2): try a PDHG step at the
+        // current eta; accept iff eta <= etabar (the local curvature bound);
+        // otherwise shrink eta and retry the step from the same (x, y).
+        int retries = 0;
+        for (;;) {
+            const double tau = eta / omega, sigma = eta * omega;
+            kern_primal<<<(n + 255) / 256, 256>>>(n, tau, d_x, d_c, d_ata,
+                                                  d_cl, d_cu, d_xnew, d_xbar,
+                                                  d_dx);
+            mvA.mv(d_xbar, d_tm);
+            kern_dual<<<(m + 255) / 256, 256>>>(m, sigma, d_y, d_tm, d_rmin,
+                                                d_rmax, d_axcur, d_ynew, d_dy,
+                                                d_adx);
+            kern_dots<<<gD, 256, 3 * 256 * sizeof(double)>>>(n, m, d_dx, d_dy,
+                                                              d_adx, d_part);
+            kern_dotfin<<<1, 256, 3 * 256 * sizeof(double)>>>(d_part, gD,
+                                                               d_dots);
+            CK(cudaMemcpy(hdots, d_dots, 3 * sizeof(double),
+                          cudaMemcpyDeviceToHost));
+            // etabar = ||(dx,dy)||_w^2 / (2 dy'A dx). Equal-step PDHG in
+            // x~ = sqrt(w)*x, y~ = y/sqrt(w) coordinates (K unchanged, the
+            // cross term invariant): w-norm = w*|dx|^2 + |dy|^2/w.
+            const double num = omega * hdots[0] + hdots[1] / omega;
+            const double cross = hdots[2];
+            const double etabar =
+                (num > 0.0 && cross > 0.0) ? num / (2.0 * cross) : INF_NAN;
+            const double kk = (double)k;
+            const double eta_new =
+                std::isfinite(etabar)
+                    ? std::min((1.0 - std::pow(kk, -0.3)) * etabar,
+                               (1.0 + std::pow(kk, -0.6)) * eta)
+                    : INF_NAN;
+            const bool accept =
+                !(eta > etabar) || num <= 0.0 || cross <= 0.0 ||
+                ++retries > 20;
+            if (accept) {
+                if (std::isfinite(eta_new) && eta_new > 1e-12)
+                    eta = std::min(eta_new, 1e12);
+                std::swap(d_x, d_xnew);
+                std::swap(d_y, d_ynew);
+                break;
+            }
+            eta = std::max(eta_new, 1e-12);
+        }
         double weta = 2.0 / ((double)hn + 2.0);
         ++hn;
-        kern_mix2<<<(n + m + 255) / 256, 256>>>(n, m, weta, d_x, d_xavg, d_y,
-                                                d_yavg);
+        kern_mix2<<<(n + 2 * m + 255) / 256, 256>>>(n, m, weta, d_x, d_xavg,
+                                                    d_y, d_yavg, d_adx,
+                                                    d_axcur);
 
         if (k % CHECK == 0) {
             Metrics mc, ma;
@@ -654,10 +819,10 @@ Solution solve(const io::Model& lp, const Options& opt) {
                         dx = std::max(dx, std::fabs(hx[j] - xprev[j]));
                 }
                 std::fprintf(stderr,
-                             "[dbg] k=%ld tau=%.3e sig=%.3e dy=%.3e dx=%.3e "
+                             "[dbg] k=%ld eta=%.3e om=%.3e dy=%.3e dx=%.3e "
                              "op=%.6g mc.pinf=%.2e ma.pinf=%.2e mc.dinf=%.2e "
                              "ma.dinf=%.2e\n",
-                             k, tau, sigma, dy, dx, last.op, mc.pinf, ma.pinf,
+                             k, eta, omega, dy, dx, last.op, mc.pinf, ma.pinf,
                              mc.dinf, ma.dinf);
                 std::copy(hy.begin(), hy.end(), yprev.begin());
                 std::copy(hx.begin(), hx.end(), xprev.begin());
@@ -765,89 +930,6 @@ Solution solve(const io::Model& lp, const Options& opt) {
                 if (repaired) break;
             }
 
-            // Step-size controller. In the march regime the product
-            // tau*sigma only ever shrinks below prod0 (growth re-pins it);
-            // shrinking tau while raising sigma with the product pinned is
-            // the divergent corner — the huge dual step amplifies the xbar
-            // extrapolation oscillation (grow22).
-            //
-            // March regime: the objective is still improving, the gap is
-            // far from certifiable (pinf << dinf), and the iterate is
-            // crawling along a feasible face — the march speed depends
-            // strongly and non-monotonically on tau (grow22: tau~1.7*rt0
-            // marches ~170x faster than rt0, tau~7*rt0 is slow again —
-            // resonance with the box-clipping pattern). Ride the edge:
-            // grow tau while the averaged iterate stays deep-feasible,
-            // back off when it degrades. The gate is objective progress,
-            // not pinf level, so it persists through the current iterate's
-            // ~1e-3 oscillation and exits by itself at convergence. The
-            // old relative-imbalance rule suppressed tau in exactly this
-            // regime and slowed sc205/grow22 >10x.
-            //
-            // Outside the march regime: the proven PDLP-style imbalance
-            // rule, plus an immediate shrink when pinf rises fast.
-            if (k >= 1000 && std::isfinite(last.pinf) && last.pinf > 0 &&
-                std::isfinite(last.dinf) && last.dinf > 0) {
-                if (k % 500 == 0) {
-                    // best-objective iterate: monotone through the march,
-                    // unlike the err-selected `last` whose op oscillates and
-                    // spuriously exits march mode mid-run (grow22 k=125k)
-                    double best_op = std::isfinite(mc.op) ? mc.op : ma.op;
-                    if (std::isfinite(ma.op) && ma.op < best_op)
-                        best_op = ma.op;
-                    double op_gain = prev_win_op - best_op;
-                    bool marching = last.pinf < 0.1 * last.dinf &&
-                                    op_gain > 1e-10 *
-                                                   (1.0 + std::fabs(
-                                                              last.op));
-                    if (marching) {
-                        if (ma.pinf > 1e-3) {
-                            // feasibility degrading: pull tau down WITHOUT
-                            // raising sigma (product shrinks = strictly
-                            // safer); a pinned product here would explode
-                            // sigma and the dual amplifies the xbar
-                            // extrapolation into divergence (grow22)
-                            tau = std::max(tau * 0.8, 0.3 * rt0);
-                        } else if (op_gain <
-                                   1e-6 * (1.0 + std::fabs(best_op))) {
-                            // arrival: the march has slowed near its target;
-                            // tighten the orbit (sigma unchanged — see
-                            // above) so the endgame settles instead of
-                            // oscillating (kb2/sc50a certification)
-                            tau = std::max(tau * 0.7, 0.3 * rt0);
-                        } else if (ma.pinf < 1e-4) {
-                            tau = std::min(tau * 1.5, 8.0 * rt0);
-                            sigma = prod0 / tau;
-                        }
-                        // boom clamp: never re-enter the step size that
-                        // blew the state up (grow22 divergence loop);
-                        // relax slowly so the controller can re-probe
-                        tau = std::min(tau, boom_cap);
-                        boom_cap *= 1.02;
-                    } else {
-                        double tgt = std::clamp(last.pinf / last.dinf, 0.1,
-                                                10.0);
-                        double cur = tau / sigma;
-                        double nxt =
-                            cur * std::clamp(tgt / cur, 0.7, 1.4);
-                        nxt = std::clamp(nxt, 0.1, 10.0);
-                        tau = std::sqrt(prod0 * nxt);
-                    }
-                    sigma = prod0 / tau;
-                    // ponytail: last.op (not best_op) — the two variants
-                    // measure slightly different window gains and sc205's
-                    // chaotic endgame is sensitive to which one gates
-                    // march mode; this one is the measured-good choice
-                    prev_win_op = last.op;
-                }
-                if (ma.pinf >= 1e-2 &&
-                    std::isfinite(prev_pinf) && ma.pinf > 4.0 * prev_pinf) {
-                    tau = std::max(tau * 0.5, 0.3 * rt0);
-                    sigma = prod0 / tau;
-                }
-                prev_pinf = ma.pinf;
-            }
-
             // Incumbent: best (lowest) objective among deep-feasible
             // iterates, current or averaged. Feasible points cannot beat
             // the true optimum, so this is an honest bound to report on
@@ -875,12 +957,11 @@ Solution solve(const io::Model& lp, const Options& opt) {
                               cudaMemcpyDeviceToDevice));
             }
             // Self-heal: a catastrophically blown-up state (pinf >= 0.5)
-            // never recovers the march regime within the budget — restore
-            // the incumbent and re-anchor averaging there with safer steps,
-            // and clamp tau to half the size that blew up so the restored
-            // state does not instantly re-diverge (grow22 divergence loop).
-            // Milder excursions are left alone: the shrunk tau lets them
-            // re-settle on their own and they keep their objective gains.
+            // never recovers within the budget — restore the incumbent,
+            // re-anchor averaging there, and shrink eta to half so the
+            // restored state does not instantly re-diverge. Milder
+            // excursions are left alone: they re-settle on their own and
+            // keep their objective gains.
             if (mc.pinf >= 0.5 && have_inc && k - last_rollback > 2000) {
                 CK(cudaMemcpy(d_x, d_xb, n * sizeof(double),
                               cudaMemcpyDeviceToDevice));
@@ -890,32 +971,107 @@ Solution solve(const io::Model& lp, const Options& opt) {
                               cudaMemcpyDeviceToDevice));
                 CK(cudaMemcpy(d_yavg, d_yb, m * sizeof(double),
                               cudaMemcpyDeviceToDevice));
-                boom_cap = std::min(boom_cap, 0.5 * tau);
-                tau = 0.3 * rt0;  // balanced-small: the original stable corner
-                sigma = prod0 / tau;
+                // restore incumbent; shrink eta and reset the epoch so the
+                // restored state does not instantly re-diverge (grow22)
+                eta = std::min(eta, 0.5 * eta0);
                 hn = 0;
-                since_restart = 0;
+                epoch_start = k;
+                epoch_kkt = -1.0;
+                prev_cand = INF_NAN;
+                // A x of the restored point: rebuild from the incumbent
+                mvA.mv(d_x, d_tm);
+                CK(cudaMemcpy(d_axcur, d_tm, m * sizeof(double),
+                              cudaMemcpyDeviceToDevice));
                 last_rollback = k;
                 if (opt.verbosity > 1)
                     std::fprintf(stderr, "[pdhg] rollback @k=%ld to inc\n", k);
             }
-            double r_now = std::isfinite(ma.err()) ? ma.err()
-                                                   : INF_NAN;
-            if (epoch_r0 == INF_NAN) epoch_r0 = r_now;
-            bool kkt_restart =
-                std::isfinite(r_now) && r_now <= 0.3 * epoch_r0;
-            if (kkt_restart || ++since_restart >= 2000) {
-                hn = 0;
+            // Restart scheme (cuPDLP.jl Alg. 1 / Restarted Halpern PDHG,
+            // Lu & Yang): every CHECK iterations, candidate = whichever of
+            // the current / averaged iterate has smaller KKT error.
+            // Restart (anchor <- candidate, Halpern weights reset, primal
+            // weight updated) when any of
+            //   (i)   KKT(z_c) <= 0.2 * KKT(epoch start)   [sufficient decay]
+            //   (ii)  KKT(z_c) <= 0.8 * KKT(epoch start)
+            //         && KKT(z_c) > KKT(previous check)    [stalled progress]
+            //   (iii) epoch length >= 0.36 * total iters   [forces omega
+            //         updates; guarantees restarts happen]
+            // (constants beta_sufficient=0.2, beta_necessary=0.8,
+            // beta_artificial=0.36, check period 64, theta=0.5 — paper.)
+            double cand = std::min(ec, ea);
+            if (epoch_kkt < 0.0) {
+                epoch_kkt = cand;
+                prev_cand = cand;
+            }
+            const long t_epoch = k - epoch_start;
+            bool restart_now =
+                (std::isfinite(cand) && std::isfinite(epoch_kkt) &&
+                 epoch_kkt > 0.0 &&
+                 (cand <= 0.2 * epoch_kkt ||
+                  (cand <= 0.8 * epoch_kkt &&
+                   std::isfinite(prev_cand) && cand > prev_cand))) ||
+                t_epoch >= 0.36 * (double)k;
+            prev_cand = cand;
+            if (restart_now) {
+                if (ea < ec) {  // anchor to the better candidate
+                    CK(cudaMemcpy(d_x, d_xavg, n * sizeof(double),
+                                  cudaMemcpyDeviceToDevice));
+                    CK(cudaMemcpy(d_y, d_yavg, m * sizeof(double),
+                                  cudaMemcpyDeviceToDevice));
+                }
                 CK(cudaMemcpy(d_xavg, d_x, n * sizeof(double),
                               cudaMemcpyDeviceToDevice));
                 CK(cudaMemcpy(d_yavg, d_y, m * sizeof(double),
                               cudaMemcpyDeviceToDevice));
-                since_restart = 0;
-                if (kkt_restart && opt.verbosity > 1)
+                hn = 0;
+                epoch_start = k;
+                epoch_kkt = cand;
+                prev_cand = INF_NAN;
+                // the anchor x may be the averaged iterate: rebuild A x
+                mvA.mv(d_x, d_tm);
+                CK(cudaMemcpy(d_axcur, d_tm, m * sizeof(double),
+                              cudaMemcpyDeviceToDevice));
+                // Primal-weight update (log-space smoothing, theta = 0.5):
+                //   omega <- exp(0.5*ln(Dy/Dx) + 0.5*ln(omega))
+                // where Dx, Dy are the distances the epoch-start points
+                // moved since the previous epoch (scaled units).
+                if (have_pe) {
+                    std::vector<double> sx(n), sy(m);
+                    CK(cudaMemcpy(sx.data(), d_x, n * sizeof(double),
+                                  cudaMemcpyDeviceToHost));
+                    CK(cudaMemcpy(sy.data(), d_y, m * sizeof(double),
+                                  cudaMemcpyDeviceToHost));
+                    double dxn = 0.0, dyn = 0.0;
+                    for (int j = 0; j < n; ++j) {
+                        double d = sx[j] - pesx[j];
+                        dxn += d * d;
+                    }
+                    for (int i = 0; i < m; ++i) {
+                        double d = sy[i] - pesy[i];
+                        dyn += d * d;
+                    }
+                    if (dxn > 1e-24 && dyn > 1e-24) {
+                        double om = std::sqrt(
+                            omega * std::sqrt(dyn / dxn));
+                        if (std::isfinite(om) && om > 0.0)
+                            omega = std::clamp(om, 1e-6, 1e6);
+                    }
+                    pesx = std::move(sx);
+                    pesy = std::move(sy);
+                } else {
+                    pesx.resize(n);
+                    pesy.resize(m);
+                    CK(cudaMemcpy(pesx.data(), d_x, n * sizeof(double),
+                                  cudaMemcpyDeviceToHost));
+                    CK(cudaMemcpy(pesy.data(), d_y, m * sizeof(double),
+                                  cudaMemcpyDeviceToHost));
+                    have_pe = true;
+                }
+                if (opt.verbosity > 1)
                     std::fprintf(stderr,
-                                 "[pdhg] KKT restart @it=%ld r=%.3e\n",
-                                 iters_run, r_now);
-                epoch_r0 = INF_NAN;
+                                 "[pdhg] restart @k=%ld t=%ld r=%.3e "
+                                 "eta=%.3e om=%.3e\n",
+                                 k, t_epoch, cand, eta, omega);
             }
 
             auto now = std::chrono::steady_clock::now();
@@ -987,6 +1143,8 @@ Solution solve(const io::Model& lp, const Options& opt) {
     cudaFree(d_x); cudaFree(d_xnew); cudaFree(d_xbar); cudaFree(d_xavg);
     cudaFree(d_y); cudaFree(d_ynew); cudaFree(d_yavg);
     cudaFree(d_xb); cudaFree(d_yb);
+    cudaFree(d_dx); cudaFree(d_dy); cudaFree(d_adx); cudaFree(d_axcur);
+    cudaFree(d_dots); cudaFree(d_part);
     cudaFree(d_ata); cudaFree(d_tm); cudaFree(d_tmpn);
     cudaFree(d_ap); cudaFree(d_ai); cudaFree(d_ax);
     cudaFree(d_cp); cudaFree(d_ci); cudaFree(d_acx);
