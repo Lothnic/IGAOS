@@ -1,2 +1,8 @@
-build/
+build*/
 benchmarks/
+.claude/
+__pycache__/
+*.so
+*.egg-info/
+dist/
+*.pyc

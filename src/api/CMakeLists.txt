@@ -1,10 +1,13 @@
-add_executable(igaos igaos_cli.cpp)
-target_link_libraries(igaos PRIVATE igaos_io igaos_simplex igaos_milp igaos_qp)
-target_include_directories(igaos PRIVATE ${CMAKE_SOURCE_DIR}/include)
+if(NOT SKBUILD)
+    add_executable(igaos igaos_cli.cpp)
+    target_link_libraries(igaos PRIVATE igaos_io igaos_simplex igaos_milp
+                                          igaos_qp)
+    target_include_directories(igaos PRIVATE ${CMAKE_SOURCE_DIR}/include)
 
-if(IGAOS_HAVE_PDHG)
-    target_link_libraries(igaos PRIVATE igaos_pdhg)
-    target_compile_definitions(igaos PRIVATE IGAOS_HAS_PDHG)
+    if(IGAOS_HAVE_PDHG)
+        target_link_libraries(igaos PRIVATE igaos_pdhg)
+        target_compile_definitions(igaos PRIVATE IGAOS_HAS_PDHG)
+    endif()
 endif()
 
 # Python bindings (opt-in; dev tool pybind11 is allowed per docs/DEPENDENCIES.md)
@@ -20,8 +23,11 @@ if(pybind11_FOUND)
         target_compile_definitions(igaos_py PRIVATE IGAOS_HAS_PDHG)
     endif()
     set_target_properties(igaos_py PROPERTIES
-        OUTPUT_NAME igaos
-        LIBRARY_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/python)
+        OUTPUT_NAME _core
+        LIBRARY_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/python/igaos)
+    # wheel/develop install: the compiled module lands inside the igaos
+    # package next to its __init__.py
+    install(TARGETS igaos_py LIBRARY DESTINATION igaos)
     message(STATUS "pybind11 found: building python/igaos bindings")
 else()
     message(STATUS "pybind11 not found: skipping python module")

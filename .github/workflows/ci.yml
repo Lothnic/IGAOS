@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install build deps
+        run: |
+          pip install pybind11 "highspy==1.15.1" pyyaml
+      - name: Configure and build
+        run: |
+          cmake -S . -B build -DCMAKE_PREFIX_PATH="$(pybind11 --cmakedir)"
+          cmake --build build -j "$(nproc)"
+      - name: Engine tests
+        run: ctest --test-dir build --output-on-failure
+      - name: Python bindings parity
+        run: python demo/test_bindings.py
+      - name: QP three-way verification
+        run: python demo/test_qp.py
+
+  wheel:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build wheel (CPU)
+        run: |
+          pip install build
+          python -m build --wheel
+      - name: Smoke-test the wheel
+        run: |
+          pip install dist/*.whl
+          python -c "
+import igaos
+sol = igaos.solve('demo/models/williams_refinery.mps', time_limit=30)
+assert sol.status == 'optimal' and abs(sol.objective + 211365.13) < 1e-2, (sol.status, sol.objective)
+print('wheel smoke:', igaos.__version__, sol.status, sol.objective)
+"

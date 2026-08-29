@@ -87,7 +87,7 @@ py::dict model_stats(const Model& m) {
 
 }  // namespace
 
-PYBIND11_MODULE(igaos, m) {
+PYBIND11_MODULE(_core, m) {
     m.doc() = "IGAOS — sovereign LP/MILP solver core (SIH26119)";
 
     py::class_<Model>(m, "Model")

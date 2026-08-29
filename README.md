@@ -1,5 +1,8 @@
 # IGAOS — Indigenous GPU-Accelerated Optimization Solver
 
+[![CI](https://github.com/Lothnic/IGAOS/actions/workflows/ci.yml/badge.svg)](https://github.com/Lothnic/IGAOS/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 A sovereign LP / MILP / QP solver core built from mathematical foundations for
 [SIH 2026 problem statement SIH26119](https://github.com/Lothnic/IGAOS/issues/1)
 (MRPL): revised simplex (primal + dual), first-order GPU methods (PDHG),
@@ -28,7 +31,28 @@ benchmarks/ harness per docs/research/benchmark-protocol.md
 tests/      assert-based engine smoke tests
 ```
 
-## Build
+## Install
+
+Python package (CPU engines — simplex LP, MILP, QP):
+
+```sh
+pip install igaos
+```
+
+```python
+import igaos
+sol = igaos.solve("model.mps", time_limit=60, engine="auto")
+sol.status, sol.objective, sol.x
+```
+
+With the **GPU PDHG engine**, build from source on a machine with the CUDA
+toolkit (auto-detected when nvcc is present):
+
+```sh
+pip install igaos --no-binary igaos --config-settings=cmake.define.IGAOS_ENABLE_CUDA=ON
+```
+
+## Build from source (CLI + tests)
 
 ```sh
 cmake -S . -B build
@@ -36,7 +60,8 @@ cmake --build build
 ```
 
 Builds CPU-only automatically when no CUDA toolchain is present (the PDHG
-engine requires CUDA).
+engine requires CUDA). The CLI binary is `build/src/api/igaos`; the Python
+module lands in `python/igaos/`. Engine tests: `ctest --test-dir build`.
 
 ## Solve
 
