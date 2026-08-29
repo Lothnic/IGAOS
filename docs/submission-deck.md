@@ -36,7 +36,8 @@ pybind11 surface.
 
 | Evidence | Result | Artifact |
 |---|---|---|
-| Netlib LP ladder (64 inst ≤700 rows) | **63/64 exact vs HiGHS** (98%), sparse-LU engine |
+| Netlib FULL mirror (114 inst, no row cap) | **101/114 matched vs HiGHS** (88.6%) — `netlib_full_results.csv` |
+| Netlib gate (64 inst ≤700 rows) | **63/64 exact** (98%) |
 | Scale proof (hanoi5, 16,399 rows) | **optimal in 195s, 154MB peak** — dense engine needed 4.3GB and failed | `docs/research/sweep_results.csv`, `demo/regress_netlib.py` |
 | False-unbounded bug class | fixed (pilot4 exact; perold honest error) | commit `4c49d09` |
 | Infeasibility detection | klein1 + refinery **proven** infeasible | `docs/research/robustness_results.csv` |
