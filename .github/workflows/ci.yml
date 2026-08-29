@@ -42,8 +42,8 @@ jobs:
         run: |
           pip install dist/*.whl
           python -c "
-import igaos
-sol = igaos.solve('demo/models/williams_refinery.mps', time_limit=30)
-assert sol.status == 'optimal' and abs(sol.objective + 211365.13) < 1e-2, (sol.status, sol.objective)
-print('wheel smoke:', igaos.__version__, sol.status, sol.objective)
-"
+          import igaos
+          sol = igaos.solve('demo/models/williams_refinery.mps', time_limit=30)
+          assert sol.status == 'optimal' and abs(sol.objective + 211365.13) < 1e-2, (sol.status, sol.objective)
+          print('wheel smoke:', igaos.__version__, sol.status, sol.objective)
+          "
