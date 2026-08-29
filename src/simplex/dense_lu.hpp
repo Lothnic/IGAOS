@@ -102,8 +102,11 @@ struct DenseLU {
 // identity with column p_i replaced by alpha_i (= B_{i-1}^{-1} a_enter).
 // Refactorize from scratch only every REFACTOR_ETA pivots (design sheet
 // #5); between refactorizations solves apply the eta transformations.
-struct EtaFile {
-    DenseLU base;
+// Templated on the base factorization (DenseLU or SparseLU) — the eta
+// composition only needs base.solve / base.solve_transpose.
+template <class BaseLU>
+struct EtaFileT {
+    BaseLU base;
     std::vector<int> piv;
     std::vector<std::vector<double>> etas;
     int m = 0;
@@ -120,12 +123,19 @@ struct EtaFile {
     // bound the damage of the extra drift.
     static constexpr int UNSTABLE_BACKOFF = 8;
 
-    void factor(std::vector<double> Bm) {
-        m = static_cast<int>(std::sqrt((double)Bm.size()));
+    // reset eta state before a fresh base factorization (the base's own
+    // factor entry point is type-specific — sparse takes CSC, dense takes
+    // a row-major matrix — so callers drive it and call this to clear)
+    void reset() {
         piv.clear();
         etas.clear();
         unstable = false;
         since_unstable = 0;
+    }
+
+    void factor(std::vector<double> Bm) {
+        m = static_cast<int>(std::sqrt((double)Bm.size()));
+        reset();
         base.factor(std::move(Bm));
         ok = base.ok;
     }
@@ -186,5 +196,7 @@ struct EtaFile {
         x = tmp;
     }
 };
+
+using EtaFile = EtaFileT<DenseLU>;
 
 }  // namespace igaos::simplex

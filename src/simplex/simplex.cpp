@@ -1,6 +1,7 @@
 #include "simplex.hpp"
 
 #include "dense_lu.hpp"
+#include "sparse_lu.hpp"
 #include "presolve.hpp"
 #include "scaling.hpp"
 
@@ -103,9 +104,49 @@ struct Engine {
                 break;
         }
     }
+
+    // append basis column bj to a CSC assembly (ri/rv) — never dense
+    void basis_col_sparse(int bj, vector<int>& ri, vector<double>& rv) const {
+        switch (kind[bj]) {
+            case KIND_X:
+                for (int p = cp[bj]; p < cp[bj + 1]; ++p) {
+                    if (cv[p] == 0.0) continue;
+                    ri.push_back(ci[p]);
+                    rv.push_back(cv[p]);
+                }
+                break;
+            case KIND_SLACK:
+                ri.push_back(bj - nx);
+                rv.push_back(-1.0);
+                break;
+            case KIND_ART:
+                ri.push_back(art_row[bj - nx - m]);
+                rv.push_back(art_sigma[bj - nx - m]);
+                break;
+        }
+    }
 };
 
 }  // namespace
+
+    // factor the basis in CSC form — sparse path, never materializes the
+    // dense m x m matrix (the O(m^2) memory wall on hanoi5-class instances)
+    bool factor_basis_csc(const Engine& E, const vector<int>& basis,
+                          SparseLU& lu) {
+        vector<int> cp(E.m + 1, 0), ri;
+        vector<double> rv;
+        for (int c = 0; c < E.m; ++c) {
+            if (basis[c] < 0) {
+                ri.push_back(c);  // empty slot: unit column e_c
+                rv.push_back(1.0);
+            } else {
+                E.basis_col_sparse(basis[c], ri, rv);
+            }
+            cp[c + 1] = (int)ri.size();
+        }
+        lu.factor_csc(E.m, cp, ri, rv);
+        return lu.ok;
+    }
 
 Solution solve(const io::Model& model, const Options& opt,
                const WarmStart* warm, WarmStart* warm_out,
@@ -214,17 +255,8 @@ Solution solve(const io::Model& model, const Options& opt,
             else { st[j] = FREE_NB; z[j] = 0.0; }
         }
         // evaluate basic values via a factorization of the restored basis
-        DenseLU wlu;
-        {
-            vector<double> Bm((size_t)E.m * E.m, 0.0), col;
-            for (int c = 0; c < E.m; ++c) {
-                if (basis[c] < 0) { Bm[(size_t)c * E.m + c] = 1.0; continue; }
-                E.basis_col(basis[c], col);
-                for (int r = 0; r < E.m; ++r)
-                    if (col[r] != 0.0) Bm[(size_t)r * E.m + c] = col[r];
-            }
-            wlu.factor(std::move(Bm));
-        }
+        SparseLU wlu;
+        factor_basis_csc(E, basis, wlu);
         if (!wlu.ok) {
             warm_ok = false;  // singular restored basis — fall back cold
         } else if (complete) {
@@ -255,16 +287,8 @@ Solution solve(const io::Model& model, const Options& opt,
             // art columns (+e_i), and replacing a basis column by e_i can
             // be singular even when the original was not
             {
-                vector<double> Bm((size_t)E.m * E.m, 0.0), col;
-                for (int c = 0; c < E.m; ++c) {
-                    if (basis[c] < 0) { Bm[(size_t)c * E.m + c] = 1.0; continue; }
-                    E.basis_col(basis[c], col);
-                    for (int r = 0; r < E.m; ++r)
-                        if (col[r] != 0.0) Bm[(size_t)r * E.m + c] = col[r];
-                }
-                DenseLU chk;
-                chk.factor(std::move(Bm));
-                if (!chk.ok) warm_ok = false;
+                SparseLU chk;
+                if (!factor_basis_csc(E, basis, chk)) warm_ok = false;
             }
         }
     }
@@ -318,22 +342,32 @@ Solution solve(const io::Model& model, const Options& opt,
         return -1;
     };
 
-    EtaFile lu;
+    // Sparse base + eta file (dense fallback inside SparseLU, plus the
+    // IGAOS_DENSE_LU=1 escape hatch that forces the old dense factor)
+    const bool force_dense_lu = getenv("IGAOS_DENSE_LU") != nullptr;
+    EtaFileT<SparseLU> lu;
     long iter = 0;  // declared before the lambdas that trace/capture it
     bool basis_dirty = true;  // eta file must be rebuilt from scratch
     vector<double> zb(E.m, 0.0);
     auto build_and_factor = [&]() {
-        vector<double> Bm((size_t)E.m * E.m, 0.0), col;
-        for (int c = 0; c < E.m; ++c) {
-            E.basis_col(basis[c], col);
-            for (int r = 0; r < E.m; ++r)
-                if (col[r] != 0.0) Bm[(size_t)r * E.m + c] = col[r];
+        lu.reset();
+        lu.m = E.m;
+        if (force_dense_lu) {
+            vector<double> Bm((size_t)E.m * E.m, 0.0), col;
+            for (int c = 0; c < E.m; ++c) {
+                E.basis_col(basis[c], col);
+                for (int r = 0; r < E.m; ++r)
+                    if (col[r] != 0.0) Bm[(size_t)r * E.m + c] = col[r];
+            }
+            lu.base.factor_dense(std::move(Bm));
+        } else {
+            factor_basis_csc(E, basis, lu.base);
         }
-        lu.factor(std::move(Bm));
+        lu.ok = lu.base.ok;
         if (getenv("IGAOS_TRACE_PIVOTS")) {
             double dmin = INF, dmax = 0.0;
             for (int i = 0; i < E.m; ++i) {
-                double d = std::fabs(lu.base.a[(size_t)i * E.m + i]);
+                double d = lu.base.pivot_mag(i);
                 dmin = std::min(dmin, d);
                 dmax = std::max(dmax, d);
             }
